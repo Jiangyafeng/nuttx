@@ -32,7 +32,6 @@
 
 #include <arch/board/board.h>
 #include <arch/irq.h>
-
 #include "chip.h"
 #include "esp_irq.h"
 
@@ -40,21 +39,33 @@
 #include "hal/systimer_ll.h"
 #include "periph_ctrl.h"
 #include "systimer.h"
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+#  include "esp_start.h"
+#  include "soc/soc_caps.h"
+#endif
+
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
-#if SOC_SYSTIMER_INT_LEVEL
+#if SYSTIMER_LL_INT_LEVEL
 #  define SYSTIMER_TRIGGER_TYPE ESP_IRQ_TRIGGER_LEVEL
 #else
 #  define SYSTIMER_TRIGGER_TYPE ESP_IRQ_TRIGGER_EDGE
-#endif /* SOC_SYSTIMER_INT_LEVEL */
+#endif /* SYSTIMER_LL_INT_LEVEL */
 
 #if defined(CONFIG_ARCH_CHIP_ESP32P4)
 #  define CHIP_SYSTIMER_SOURCE SYSTIMER_TARGET0_INTR_SOURCE
+#elif defined(CONFIG_ARCH_CHIP_ESP32S31)
+#  define CHIP_SYSTIMER_SOURCE ETS_SYSTIMER_TARGET0_INTR_SOURCE
+#  define CHIP_SYSTIMER_PRIORITY ESP_IRQ_PRIORITY_2
 #else
 #  define CHIP_SYSTIMER_SOURCE SYSTIMER_TARGET0_EDGE_INTR_SOURCE
+#endif
+
+#ifndef CHIP_SYSTIMER_PRIORITY
+#  define CHIP_SYSTIMER_PRIORITY ESP_IRQ_PRIORITY_DEFAULT
 #endif
 
 /****************************************************************************
@@ -64,6 +75,11 @@
 /* Systimer HAL layer object */
 
 static systimer_hal_context_t systimer_hal;
+
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+extern int ets_printf(const char *fmt, ...);
+extern void ets_delay_us(uint32_t us);
+#endif
 
 /****************************************************************************
  * Private Functions
@@ -125,6 +141,14 @@ void up_timer_initialize(void)
         {
           systimer_ll_enable_bus_clock(true);
           systimer_ll_reset_register();
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+          /* ESP32-S31 gates the SYSTIMER functional clock separately from
+           * its APB register clock.  Both clocks are required before a
+           * counter snapshot can complete or an alarm can fire.
+           */
+
+          systimer_ll_enable_sys_clock(true);
+#endif
         }
     }
 
@@ -141,9 +165,27 @@ void up_timer_initialize(void)
                                 0);
   systimer_ll_apply_counter_value(systimer_hal.dev,
                                   SYSTIMER_COUNTER_OS_TICK);
+
+  /* UNIT1 stall-en resets to 1 for both cores.  Clear every core before
+   * re-enabling stall only for CPUs that actually run NuttX.
+   */
+
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+    {
+      int cpu;
+
+      for (cpu = 0; cpu < SOC_CPU_CORES_NUM; cpu++)
+        {
+          systimer_hal_counter_can_stall_by_cpu(&systimer_hal,
+                                                SYSTIMER_COUNTER_OS_TICK,
+                                                cpu, false);
+        }
+    }
+#else
   systimer_hal_counter_can_stall_by_cpu(&systimer_hal,
                                         SYSTIMER_COUNTER_OS_TICK, 0,
                                         false);
+#endif
 
   systimer_hal_connect_alarm_counter(&systimer_hal,
                                      SYSTIMER_ALARM_OS_TICK_CORE0,
@@ -162,7 +204,7 @@ void up_timer_initialize(void)
   systimer_hal_enable_counter(&systimer_hal, SYSTIMER_COUNTER_OS_TICK);
 
   esp_setup_irq(CHIP_SYSTIMER_SOURCE,
-                ESP_IRQ_PRIORITY_DEFAULT,
+                CHIP_SYSTIMER_PRIORITY,
                 SYSTIMER_TRIGGER_TYPE,
                 systimer_irq_handler,
                 NULL);
@@ -170,4 +212,5 @@ void up_timer_initialize(void)
   /* Enable the allocated CPU interrupt. */
 
   up_enable_irq(ESP_SOURCE2IRQ(CHIP_SYSTIMER_SOURCE));
+
 }

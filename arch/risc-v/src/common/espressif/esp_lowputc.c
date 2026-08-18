@@ -337,6 +337,19 @@ bool esp_lowputc_uart_module_enable(const struct esp_uart_s *priv)
   bool newly_enabled = false;
   mutex_t lock;
 
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+  /* The ROM/simple boot path already enables the console UART.  This routine
+   * runs before nx_start(), so acquiring an nxmutex here would require a
+   * scheduler/current-task context that does not exist yet.
+   */
+
+  if (uart_num == CONFIG_ESP_CONSOLE_UART_NUM)
+    {
+      g_uart_context[uart_num].hw_enabled = true;
+      return false;
+    }
+#endif
+
   nxmutex_init(&lock);
 
   g_uart_context[uart_num].mutex = (_lock_t)&lock;

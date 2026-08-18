@@ -55,6 +55,9 @@ endif()
 
 if(CONFIG_ELF)
   list(APPEND SRCS elf.c)
+  if(CONFIG_ELF_APP_VERIFY)
+    list(APPEND SRCS elf_verify_app.c)
+  endif()
 endif()
 
 if(CONFIG_NXFLAT)

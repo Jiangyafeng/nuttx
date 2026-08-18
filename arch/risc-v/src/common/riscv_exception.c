@@ -32,11 +32,11 @@
 #include <nuttx/debug.h>
 #include <nuttx/irq.h>
 #include <nuttx/arch.h>
-#ifdef CONFIG_PAGING
+#if defined(CONFIG_PAGING) || defined(CONFIG_ARCH_ADDRENV)
 #  include <nuttx/pgalloc.h>
 #endif
 
-#ifdef CONFIG_PAGING
+#if defined(CONFIG_PAGING) || defined(CONFIG_ARCH_ADDRENV)
 #  include "pgalloc.h"
 #  include "riscv_mmu.h"
 #endif
@@ -81,6 +81,67 @@ static const char *g_reasons_str[RISCV_MAX_EXCEPTION + 1] =
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
+
+#ifdef CONFIG_ARCH_ADDRENV
+/****************************************************************************
+ * Name: riscv_dump_translation
+ *
+ * Description:
+ *   Report the translation state behind a page fault.  Without demand
+ *   paging every region of an address environment is mapped before its first
+ *   user instruction runs, so a page fault means either that this hart has
+ *   the wrong root table installed or that the leaf entry is not visible to
+ *   its page-table walker.  Those two causes need different fixes, and the
+ *   privilege state decides whether the fault is even recoverable.
+ *
+ * Input Parameters:
+ *   vaddr - The faulting virtual address.
+ *   regs  - A pointer to the register state at the time of the exception.
+ *
+ ****************************************************************************/
+
+static void riscv_dump_translation(uintreg_t vaddr, void *regs)
+{
+  struct tcb_s *tcb    = this_task();
+  uintptr_t     satp   = READ_CSR(CSR_SATP);
+  uintptr_t     want   = 0;
+  uintptr_t     l1pte  = 0;
+  uintptr_t     l2pte  = 0;
+  uintptr_t     lnvaddr;
+
+  if (tcb->addrenv_curr != NULL)
+    {
+      want = tcb->addrenv_curr->addrenv.satp;
+    }
+
+  lnvaddr = riscv_pgvaddr(mmu_satp_to_paddr(satp));
+  if (lnvaddr != 0)
+    {
+      l1pte   = mmu_ln_getentry(1, lnvaddr, vaddr);
+      lnvaddr = (l1pte & PTE_VALID) != 0 ?
+                riscv_pgvaddr(mmu_pte_to_paddr(l1pte)) : 0;
+      if (lnvaddr != 0)
+        {
+          l2pte = mmu_ln_getentry(ARCH_PGT_MAX_LEVELS, lnvaddr, vaddr);
+        }
+    }
+
+  _alert("ADDRENV: cpu=%d pid=%d flags=%04x status=%" PRIxREG
+         " satp=%" PRIxPTR " want=%" PRIxPTR " va=%" PRIxREG
+         " l1=%" PRIxPTR " l2=%" PRIxPTR "\n",
+         this_cpu(), tcb->pid, tcb->flags,
+         ((uintreg_t *)regs)[REG_INT_CTX], satp, want, vaddr, l1pte, l2pte);
+
+#ifdef CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS
+  /* On a CLIC implementation the privilege that xret restored comes from the
+   * cause register's extension fields, not only from status.SPP.
+   */
+
+  _alert("ADDRENV: cause=%" PRIxREG " xcause=%" PRIxREG "\n",
+         READ_CSR(CSR_CAUSE), ((uintreg_t *)regs)[REG_INT_CTX + 1]);
+#endif
+}
+#endif /* CONFIG_ARCH_ADDRENV */
 
 /****************************************************************************
  * Name: riscv_fault_handler
@@ -131,6 +192,17 @@ static void riscv_fault_handler(uintreg_t cause, void *regs)
       running_regs()[REG_A0] = (void *)SIGSEGV;
       ((uintreg_t *)running_regs())[REG_INT_CTX] |= STATUS_PPP;
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS)
+      /* S31 CLIC xret consumes the previous-privilege state saved in the
+       * first integer-extension slot as well as sstatus.SPP.  The exception
+       * frame still describes the original U-mode fault, so synchronize its
+       * CLIC XPPS bit before redirecting execution to privileged _exit().
+       */
+
+      ((uintreg_t *)running_regs())[REG_INT_CTX + 1] |= UINT32_C(0x10000000);
+#endif
+
       /* Continue with kernel stack in use. The frame(s) in kernel stack
        * are no longer needed, so just set it to top
        */
@@ -162,6 +234,14 @@ int riscv_exception(int mcause, void *regs, void *args)
          ", MTVAL: %" PRIxREG "\n",
          mcause > RISCV_MAX_EXCEPTION ? "Unknown" : g_reasons_str[cause],
          cause, READ_CSR(CSR_EPC), READ_CSR(CSR_TVAL));
+
+#ifdef CONFIG_ARCH_ADDRENV
+  if (cause == RISCV_IRQ_INSTRUCTIONPF || cause == RISCV_IRQ_LOADPF ||
+      cause == RISCV_IRQ_STOREPF)
+    {
+      riscv_dump_translation(READ_CSR(CSR_TVAL), regs);
+    }
+#endif
 
   riscv_fault_handler(cause, regs);
 
@@ -246,7 +326,7 @@ int riscv_fillpage(int mcause, void *regs, void *args)
         {
           /* Nothing yet, allocate one page for next level page table */
 
-          paddr = mm_pgalloc(1);
+          paddr = riscv_pgtable_alloc();
           if (!paddr)
             {
               return -ENOMEM;

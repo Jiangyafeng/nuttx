@@ -47,7 +47,9 @@ if(NOT CONFIG_ARCH_IDLE_CUSTOM)
 endif()
 
 if(CONFIG_SMP)
-  list(APPEND SRCS riscv_smpcall.c riscv_cpustart.c)
+  if(NOT CONFIG_ESP32S31_SMP)
+    list(APPEND SRCS riscv_smpcall.c riscv_cpustart.c)
+  endif()
 endif()
 
 if(CONFIG_ARCH_HAVE_MULTICPU)

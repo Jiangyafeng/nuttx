@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include <nuttx/signal.h>
+#include <nuttx/init.h>
 #include <nuttx/mutex.h>
 #include <nuttx/lib/lib.h>
 
@@ -180,6 +181,12 @@ void _raise_r(struct _reent *r)
 
 void _lock_init(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY())
+    {
+      *lock = NULL;
+      return;
+    }
+
   mutex_t *mutex = (mutex_t *)kmm_malloc(sizeof(mutex_t));
 
   nxmutex_init(mutex);
@@ -189,6 +196,12 @@ void _lock_init(_lock_t *lock)
 
 void _lock_init_recursive(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY())
+    {
+      *lock = NULL;
+      return;
+    }
+
   rmutex_t *rmutex = (rmutex_t *)kmm_malloc(sizeof(rmutex_t));
 
   nxrmutex_init(rmutex);
@@ -198,6 +211,12 @@ void _lock_init_recursive(_lock_t *lock)
 
 void _lock_close(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY() || *lock == NULL)
+    {
+      *lock = NULL;
+      return;
+    }
+
   mutex_t *mutex = (mutex_t *)(*lock);
 
   nxmutex_destroy(mutex);
@@ -207,6 +226,12 @@ void _lock_close(_lock_t *lock)
 
 void _lock_close_recursive(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY() || *lock == NULL)
+    {
+      *lock = NULL;
+      return;
+    }
+
   rmutex_t *rmutex = (rmutex_t *)(*lock);
 
   nxrmutex_destroy(rmutex);
@@ -216,6 +241,17 @@ void _lock_close_recursive(_lock_t *lock)
 
 void _lock_acquire(_lock_t *lock)
 {
+  /* Espressif startup code uses libc locks while clocks, MMU and PSRAM are
+   * initialized, before nx_start() has created the kernel heap and task
+   * lists.  Match ESP-IDF's contract: locking is a no-op until the scheduler
+   * is running; the first runtime acquisition lazily creates the mutex.
+   */
+
+  if (!OSINIT_OS_READY())
+    {
+      return;
+    }
+
   if (*lock == NULL)
     {
       mutex_t *mutex = (mutex_t *)kmm_malloc(sizeof(mutex_t));
@@ -230,6 +266,11 @@ void _lock_acquire(_lock_t *lock)
 
 void _lock_acquire_recursive(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY())
+    {
+      return;
+    }
+
   if (*lock == NULL)
     {
       rmutex_t *rmutex = (rmutex_t *)kmm_malloc(sizeof(rmutex_t));
@@ -244,6 +285,11 @@ void _lock_acquire_recursive(_lock_t *lock)
 
 int _lock_try_acquire(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY())
+    {
+      return 0;
+    }
+
   if (*lock == NULL)
     {
       mutex_t *mutex = (mutex_t *)kmm_malloc(sizeof(mutex_t));
@@ -258,6 +304,11 @@ int _lock_try_acquire(_lock_t *lock)
 
 int _lock_try_acquire_recursive(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY())
+    {
+      return 0;
+    }
+
   if (*lock == NULL)
     {
       rmutex_t *rmutex = (rmutex_t *)kmm_malloc(sizeof(rmutex_t));
@@ -272,6 +323,11 @@ int _lock_try_acquire_recursive(_lock_t *lock)
 
 void _lock_release(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY())
+    {
+      return;
+    }
+
   mutex_t *mutex = (mutex_t *)(*lock);
 
   nxmutex_unlock(mutex);
@@ -279,6 +335,11 @@ void _lock_release(_lock_t *lock)
 
 void _lock_release_recursive(_lock_t *lock)
 {
+  if (!OSINIT_OS_READY())
+    {
+      return;
+    }
+
   rmutex_t *rmutex = (rmutex_t *)(*lock);
 
   nxrmutex_unlock(rmutex);
@@ -464,4 +525,3 @@ void esp_setup_syscall_table(void)
   _LOCK_T magic_mutex = (_LOCK_T)&magic_val;
   esp_rom_newlib_init_common_mutexes(magic_mutex, magic_mutex);
 }
-

@@ -34,7 +34,6 @@
 
 #include <nuttx/irq.h>
 #include <nuttx/arch.h>
-
 #include "irq/irq.h"
 
 #include "riscv_internal.h"
@@ -101,12 +100,34 @@ static void esp_clear_handle(int cpu, int irq);
 
 static volatile intr_handle_t g_handle_map[CONFIG_SMP_NCPUS][NR_IRQS];
 
+/* Cache the pieces needed by the IRAM demultiplexer.  The vendor handle
+ * query and handler-table accessors live in flash and cannot be used while
+ * an IRAM interrupt is servicing a cache-off window.
+ */
+
+static int8_t g_cpuint_map[CONFIG_SMP_NCPUS][NR_IRQS];
+static bool g_edge_map[CONFIG_SMP_NCPUS][NR_IRQS];
+static FAR struct intr_adapter_from_nuttx
+  *g_adapter_map[CONFIG_SMP_NCPUS][NR_IRQS];
+
 #ifdef CONFIG_ESPRESSIF_IRAM_ISR_DEBUG
 /* The g_iram_count keeps track of how many times such an IRQ ran when the
  * non-IRAM interrupts were disabled.
  */
 
 static uint64_t g_iram_count[CONFIG_SMP_NCPUS][NR_IRQS];
+#endif
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+/* Set by the demultiplexer when a forwarded interrupt reached no handler.
+ * Its source cannot have been quieted, so the CLIC input has to stay masked
+ * rather than be released:  a still-asserted level source would re-enter the
+ * handler immediately and forever.  Only ever written and read by the
+ * dispatch path of one CPU, with that CPU's interrupts already taken.
+ */
+
+static bool g_irq_unhandled[CONFIG_SMP_NCPUS];
 #endif
 
 /****************************************************************************
@@ -135,8 +156,13 @@ static void esp_cpuint_initialize(void)
 {
   /* Set CPU interrupt threshold level */
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  WRITE_CSR(CSR_SINTTHRESH, CLIC_INT_THRESH(RVHAL_INTR_ENABLE_THRESH));
+#else
   esprv_int_set_threshold(RVHAL_INTR_ENABLE_THRESH);
   rv_utils_intr_global_enable();
+#endif
 }
 
 #ifdef CONFIG_ESPRESSIF_IRAM_ISR_DEBUG
@@ -166,6 +192,40 @@ IRAM_ATTR static void esp_irq_iram_interrupt_record(int irq, int cpu)
   leave_critical_section(flags);
 }
 #endif
+
+/****************************************************************************
+ * Name: esp_edge_ack
+ *
+ * Description:
+ *   Release the pending state of an edge-triggered CPU interrupt.
+ *
+ *   On the S31 in machine mode the pending flag of a CLIC input is an
+ *   ordinary read/write bit, so the ESP-IDF helper -- which writes a one to
+ *   it -- leaves it asserted.  The interrupt is then taken again on every
+ *   exception return and no task ever gets to run.  Clear the bit instead.
+ *
+ ****************************************************************************/
+
+IRAM_ATTR static void esp_edge_ack(int cpuint)
+{
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && !defined(CONFIG_ARCH_USE_S_MODE)
+  uintptr_t reg = CLIC_INT_CTRL_REG(cpuint + CLIC_EXT_INTR_NUM_OFFSET);
+
+  REG_WRITE(reg, REG_READ(reg) & ~CLIC_INT_IP_M);
+#else
+  esp_cpu_intr_edge_ack(cpuint);
+#endif
+}
+
+IRAM_ATTR static void esp_irq_set_unhandled(int cpu)
+{
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  g_irq_unhandled[cpu] = true;
+#else
+  UNUSED(cpu);
+#endif
+}
 
 IRAM_ATTR static void isr_adapter_func(void *arg)
 {
@@ -199,7 +259,8 @@ IRAM_ATTR static void isr_adapter_func(void *arg)
 IRAM_ATTR static int esp_isr_demultiplexing(int irq, void *context,
                                             void *arg)
 {
-  int cpuint = esp_get_cpuint(this_cpu(), irq);
+  int cpu = this_cpu();
+  int cpuint = esp_get_cpuint(cpu, irq);
   intr_handler_t handler;
   struct intr_adapter_from_nuttx *handler_arg;
 
@@ -210,12 +271,21 @@ IRAM_ATTR static int esp_isr_demultiplexing(int irq, void *context,
   if (cpuint < 0 || cpuint >= SOC_CPU_INTR_NUM)
     {
       irqwarn("IRQ %d has invalid cpuint=%d (not registered)", irq, cpuint);
+      esp_irq_set_unhandled(cpu);
       return OK;
     }
 
-  handler = (intr_handler_t)esp_cpu_intr_get_handler(cpuint);
-  handler_arg = (struct intr_adapter_from_nuttx *)
-                  esp_cpu_intr_get_handler_arg(cpuint);
+  handler_arg = g_adapter_map[cpu][irq];
+  if (handler_arg != NULL)
+    {
+      handler = isr_adapter_func;
+    }
+  else
+    {
+      handler = (intr_handler_t)esp_cpu_intr_get_handler(cpuint);
+      handler_arg = (struct intr_adapter_from_nuttx *)
+                      esp_cpu_intr_get_handler_arg(cpuint);
+    }
 
   /* If the handler is the isr_adapter_func, then we need to set the irq
    * and context to the handler_arg. This is true for all interrupts set via
@@ -242,6 +312,7 @@ IRAM_ATTR static int esp_isr_demultiplexing(int irq, void *context,
        */
 
       irqwarn("No handler for irq=%d cpuint=%d\n", irq, cpuint);
+      esp_irq_set_unhandled(cpu);
     }
 
   return OK;
@@ -291,12 +362,26 @@ void up_irqinitialize(void)
       for (j = 0; j < CONFIG_SMP_NCPUS; j++)
         {
           g_handle_map[j][i] = IRQ_UNMAPPED;
+          g_cpuint_map[j][i] = -1;
+          g_edge_map[j][i] = false;
+          g_adapter_map[j][i] = NULL;
         }
     }
 
   /* Initialize CPU interrupts */
 
   esp_cpuint_initialize();
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31)
+  /* The S31 Wi-Fi binary installs its ISR directly on CPU interrupt 1.
+   * Reserve that vector before esp_timer and other IDF components allocate
+   * interrupts, otherwise a later Wi-Fi install silently replaces the
+   * existing handler (notably SYSTIMER target2 used by esp_timer, and the
+   * console UART).  This applies to both privilege modes.
+   */
+
+  DEBUGASSERT(esp_intr_reserve(1, 0) == ESP_OK);
+#endif
 
   /* Initialize GPIO interrupt support */
 
@@ -353,6 +438,31 @@ void up_enable_irq(int irq)
     {
       irqerr("Failed to enable interrupt %d\n", irq);
     }
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  else
+    {
+      /* esp_intr_alloc() enables the CPU interrupt before esp_setup_irq()
+       * publishes its handle in g_handle_map.  A level source that is
+       * already pending can therefore reach the S-mode dispatcher in that
+       * small window.  The monitor correctly masks the then-unclaimed CLIC
+       * input, but esp_intr_enable() only restores the interrupt-matrix
+       * route for peripheral sources and does not set CLIC IE again.
+       *
+       * up_enable_irq() is the point at which the NuttX mapping is complete.
+       * Re-enable the CPU input here so an early pending interrupt is not
+       * lost permanently.  The operation is idempotent for the normal path.
+       */
+
+      int cpuint = esp_intr_get_intno(intr_handle);
+
+      if (cpuint >= 0 && cpuint < ESP_NCPUINTS)
+        {
+          esp_cpu_intr_enable(1U << cpuint);
+        }
+    }
+#endif
 }
 
 /****************************************************************************
@@ -495,6 +605,8 @@ int esp_setup_irq_with_flags_intrstatus(int source,
    */
 
   esp_set_handle(this_cpu(), irq, ret_handle);
+  g_edge_map[this_cpu()][irq] = (flags & ESP_INTR_FLAG_EDGE) != 0;
+  g_adapter_map[this_cpu()][irq] = isr_adapter_args;
 
   return cpuint;
 }
@@ -575,6 +687,10 @@ IRAM_ATTR void *riscv_dispatch_irq(uintreg_t mcause, uintreg_t *regs)
 
       if (irq < 0)
         {
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+          esp32s31_smode_irq_drop(cpuint);
+#endif
           /* No handle found for this CPU interrupt. This can happen
            * if the interrupt was triggered but not properly registered.
            */
@@ -594,25 +710,55 @@ IRAM_ATTR void *riscv_dispatch_irq(uintreg_t mcause, uintreg_t *regs)
         }
 #endif
 
-      is_edge = esprv_int_get_type(cpuint) == INTR_TYPE_LEVEL;
+      is_edge = g_edge_map[cpu][irq];
       if (is_edge)
         {
           /* Clear edge interrupts. */
 
-          esp_cpu_intr_edge_ack(cpuint);
+          esp_edge_ack(cpuint);
         }
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+      g_irq_unhandled[cpu] = false;
+#endif
+
+      regs = riscv_doirq(irq, regs);
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+      /* The M-mode monitor masked this CLIC input before forwarding it, and
+       * the handler has now acknowledged the peripheral source, so release
+       * the input without disturbing any other interrupt still in flight.
+       *
+       * This has to happen for every forwarded input on the one path they
+       * all take.  Doing it where the handler is called instead leaves the
+       * input masked whenever no handler is found, and nothing else can
+       * ever re-enable it.
+       *
+       * Wi-Fi CPU interrupt 1 is level-triggered and intentionally stays
+       * masked until its vendor worker runs in task context.
+       */
+
+      if (g_irq_unhandled[cpu])
+        {
+          g_irq_unhandled[cpu] = false;
+          esp32s31_smode_irq_drop(cpuint);
+        }
+      else if (cpuint != 1)
+        {
+          esp32s31_smode_irq_ack(cpuint);
+        }
+#endif
+
+      return regs;
     }
-  else
-    {
-      /* It's exception */
 
-      irq = mcause &
-            (VECTORS_MCAUSE_INTBIT_MASK | VECTORS_MCAUSE_REASON_MASK);
-    }
+  /* It's an exception */
 
-  regs = riscv_doirq(irq, regs);
+  irq = mcause & (VECTORS_MCAUSE_INTBIT_MASK | VECTORS_MCAUSE_REASON_MASK);
 
-  return regs;
+  return riscv_doirq(irq, regs);
 }
 
 /****************************************************************************
@@ -633,11 +779,65 @@ irqstate_t up_irq_enable(void)
 {
   irqstate_t flags;
 
-  /* Read mstatus & set machine interrupt enable (MIE) in mstatus */
+  /* Set the global interrupt-enable bit for the configured privilege mode. */
 
-  flags = READ_AND_SET_CSR(CSR_MSTATUS, MSTATUS_MIE);
+  flags = READ_AND_SET_CSR(CSR_STATUS, STATUS_IE);
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  esp32s31_smode_irq_reenable();
+#endif
+
   return flags;
 }
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+/****************************************************************************
+ * Name: esp32s31_smode_irq_reenable
+ *
+ * Description:
+ *   Ask the S31 M-mode monitor to retry CLIC inputs that were masked while
+ *   S-mode had interrupts disabled.  This is deliberately called only from
+ *   normal interrupt-enable/restore paths, where the interrupted stack and
+ *   register context are complete and a nested scheduler decision is safe.
+ ****************************************************************************/
+
+IRAM_ATTR noinstrument_function void esp32s31_smode_irq_reenable(void)
+{
+  __asm__ __volatile__
+    (
+      "li a0, 3\n"
+      "ecall\n"
+      :
+      :
+      : "a0", "a1", "memory"
+    );
+}
+
+/****************************************************************************
+ * Name: esp32s31_smode_irq_ack
+ *
+ * Description:
+ *   Acknowledge one forwarded CLIC input after its S-mode handler has
+ *   cleared the peripheral interrupt source.
+ ****************************************************************************/
+
+IRAM_ATTR noinstrument_function void esp32s31_smode_irq_ack(int cpuint)
+{
+  register uintptr_t service __asm__("a0") = 7;
+  register uintptr_t source __asm__("a1") = cpuint;
+
+  __asm__ __volatile__
+    (
+      "ecall\n"
+      : "+r"(service), "+r"(source)
+      :
+      : "memory"
+    );
+}
+
+#endif
 
 /****************************************************************************
  * Name:  esp_set_handle
@@ -666,6 +866,7 @@ int esp_set_handle(int cpu, int irq, intr_handle_t handle)
     }
 
   g_handle_map[cpu][irq] = handle;
+  g_cpuint_map[cpu][irq] = esp_intr_get_intno(handle);
 
   return OK;
 }
@@ -709,6 +910,9 @@ intr_handle_t esp_get_handle(int cpu, int irq)
 static void esp_clear_handle(int cpu, int irq)
 {
   g_handle_map[cpu][irq] = IRQ_UNMAPPED;
+  g_cpuint_map[cpu][irq] = -1;
+  g_edge_map[cpu][irq] = false;
+  g_adapter_map[cpu][irq] = NULL;
 }
 
 /****************************************************************************
@@ -729,14 +933,7 @@ static void esp_clear_handle(int cpu, int irq)
 
 IRAM_ATTR int esp_get_cpuint(int cpu, int irq)
 {
-  intr_handle_t intr_handle = esp_get_handle(cpu, irq);
-
-  if (intr_handle != IRQ_UNMAPPED && intr_handle != NULL)
-    {
-      return esp_intr_get_intno(intr_handle);
-    }
-
-  return -EINVAL;
+  return g_cpuint_map[cpu][irq];
 }
 
 /****************************************************************************
@@ -788,18 +985,12 @@ void esp_get_iram_interrupt_records(uint64_t *irq_count, int cpu)
 IRAM_ATTR int esp_cpuint_to_irq(int cpuint, int cpu)
 {
   int irq;
-  intr_handle_t handle;
 
   for (irq = 0; irq < NR_IRQS; irq++)
     {
-      handle = g_handle_map[cpu][irq];
-      if (handle != IRQ_UNMAPPED && handle != NULL)
+      if (g_cpuint_map[cpu][irq] == cpuint)
         {
-          if (esp_intr_get_intno(handle) == cpuint &&
-              esp_intr_get_cpu(handle) == cpu)
-            {
-              return irq;
-            }
+          return irq;
         }
     }
 

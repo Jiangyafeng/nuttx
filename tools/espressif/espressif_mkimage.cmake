@@ -198,6 +198,19 @@ else()
     message(FATAL_ERROR "esptool.py elf2image failed")
   endif()
 
+  if(CONFIG_ARCH_CHIP_ESP32S31 AND CONFIG_ESPRESSIF_SIMPLE_BOOT)
+    execute_process(
+      COMMAND
+        ${PYTHON3}
+        ${SOURCE_DIR}/tools/espressif/esp32s31_simple_boot_digest.py
+        ${BINARY_DIR}/nuttx.bin
+      RESULT_VARIABLE ESP32S31_DIGEST_RESULT)
+
+    if(NOT ESP32S31_DIGEST_RESULT EQUAL 0)
+      message(FATAL_ERROR "Failed to add the ESP32-S31 simple-boot digest")
+    endif()
+  endif()
+
   message(STATUS "Generated: nuttx.bin")
 endif()
 
@@ -330,12 +343,81 @@ if(CONFIG_ESPRESSIF_BOOTLOADER_MCUBOOT)
   endif()
 
 elseif(CONFIG_ESPRESSIF_SIMPLE_BOOT)
-  # Simple boot: same base offset as BL_OFFSET (0x2000 on ESP32-P4, else 0x0)
+  # Simple boot: same base offset as BL_OFFSET (0x2000 on ESP32-P4/S31,
+  # else 0x0)
   list(APPEND ESPTOOL_BINS ${BL_OFFSET} "${BINARY_DIR}/nuttx.bin")
 
 else()
   # Legacy boot: application at offset 0
   list(APPEND ESPTOOL_BINS 0x0000 "${BINARY_DIR}/nuttx.bin")
+endif()
+
+if(CONFIG_ESP32S31_FLASH_APPFS)
+  if(CONFIG_ESPRESSIF_SECURE_FLASH_ENC_ENABLED)
+    message(
+      FATAL_ERROR
+        "ESP32-S31 external appfs image encryption is not implemented")
+  endif()
+
+  set(APPFS_IMAGE "${BINARY_DIR}/appfs.img")
+  if(NOT EXISTS "${APPFS_IMAGE}")
+    message(FATAL_ERROR "ESP32-S31 appfs image not found: ${APPFS_IMAGE}")
+  endif()
+
+  file(SIZE "${APPFS_IMAGE}" APPFS_IMAGE_SIZE)
+  file(SIZE "${BINARY_DIR}/nuttx.bin" NUTTX_IMAGE_SIZE)
+  math(EXPR APPFS_OFFSET "${CONFIG_ESPRESSIF_STORAGE_MTD_OFFSET}")
+  math(EXPR APPFS_PARTITION_SIZE "${CONFIG_ESPRESSIF_STORAGE_MTD_SIZE}")
+  math(EXPR APPFS_SEED_SIZE "${CONFIG_ESP32S31_FLASH_APPFS_SEED_SIZE}")
+  math(EXPR APPFS_PARTITION_END "${APPFS_OFFSET} + ${APPFS_PARTITION_SIZE}")
+  math(EXPR NUTTX_IMAGE_END "${BL_OFFSET} + ${NUTTX_IMAGE_SIZE}")
+  math(EXPR APPFS_OFFSET_ALIGNMENT "${APPFS_OFFSET} % 4096")
+  math(EXPR APPFS_SIZE_ALIGNMENT "${APPFS_PARTITION_SIZE} % 4096")
+  math(EXPR APPFS_SEED_ALIGNMENT "${APPFS_SEED_SIZE} % 4096")
+
+  if(APPFS_OFFSET_ALIGNMENT OR APPFS_SIZE_ALIGNMENT OR APPFS_SEED_ALIGNMENT)
+    message(FATAL_ERROR "ESP32-S31 appfs partition and seed must be 4 KiB aligned")
+  endif()
+  if(APPFS_SEED_SIZE GREATER_EQUAL APPFS_PARTITION_SIZE)
+    message(FATAL_ERROR "ESP32-S31 appfs seed must be smaller than its partition")
+  endif()
+  if(APPFS_IMAGE_SIZE GREATER APPFS_SEED_SIZE)
+    message(
+      FATAL_ERROR
+        "appfs.img (${APPFS_IMAGE_SIZE} bytes) exceeds its seed region (${APPFS_SEED_SIZE} bytes)"
+    )
+  endif()
+  if(APPFS_OFFSET LESS NUTTX_IMAGE_END)
+    message(
+      FATAL_ERROR
+        "appfs partition at ${APPFS_OFFSET} overlaps NuttX image ending at ${NUTTX_IMAGE_END}"
+    )
+  endif()
+
+  if(CONFIG_ESPRESSIF_FLASH_2M)
+    set(ESP32S31_FLASH_CAPACITY 0x200000)
+  elseif(CONFIG_ESPRESSIF_FLASH_4M)
+    set(ESP32S31_FLASH_CAPACITY 0x400000)
+  elseif(CONFIG_ESPRESSIF_FLASH_8M)
+    set(ESP32S31_FLASH_CAPACITY 0x800000)
+  elseif(CONFIG_ESPRESSIF_FLASH_16M)
+    set(ESP32S31_FLASH_CAPACITY 0x1000000)
+  elseif(CONFIG_ESPRESSIF_FLASH_32M)
+    set(ESP32S31_FLASH_CAPACITY 0x2000000)
+  endif()
+
+  if(DEFINED ESP32S31_FLASH_CAPACITY AND
+     APPFS_PARTITION_END GREATER ESP32S31_FLASH_CAPACITY)
+    message(FATAL_ERROR "ESP32-S31 appfs partition exceeds configured flash")
+  endif()
+
+  list(APPEND ESPTOOL_BINS ${CONFIG_ESPRESSIF_STORAGE_MTD_OFFSET}
+       "${APPFS_IMAGE}")
+  file(APPEND "${BINARY_DIR}/nuttx.manifest" "appfs.img\n")
+  message(
+    STATUS
+      "AppFS: ${CONFIG_ESPRESSIF_STORAGE_MTD_OFFSET} -> ${APPFS_IMAGE} (${APPFS_IMAGE_SIZE} bytes)"
+  )
 endif()
 
 # ##############################################################################

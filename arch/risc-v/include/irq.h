@@ -697,6 +697,13 @@ EXTERN volatile bool g_interrupt_context[CONFIG_SMP_NCPUS];
 
 irqstate_t up_irq_enable(void);
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE) && defined(__KERNEL__)
+/* Retry CLIC inputs that the M-mode shim deferred while SIE was clear. */
+
+void esp32s31_smode_irq_reenable(void) noinstrument_function;
+#endif
+
 /****************************************************************************
  * Name: up_cpu_index
  *
@@ -802,6 +809,19 @@ void up_irq_restore(irqstate_t flags)
       : "r" (flags)
       : "memory"
     );
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE) && defined(__KERNEL__)
+  /* Unlike an exception return, the task/ISR stack is fully valid here, so
+   * it is safe for a just-released CLIC input to interrupt this helper and
+   * even request a context switch.
+   */
+
+  if ((flags & STATUS_IE) != 0)
+    {
+      esp32s31_smode_irq_reenable();
+    }
+#endif
 }
 
 /****************************************************************************

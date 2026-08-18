@@ -433,6 +433,19 @@ config ARCH_HAVE_ADDRENV
 	bool
 	default n
 
+config ARCH_HAVE_ADDRENV_DESELECT
+	bool
+	default y if ARCH_RISCV
+	default n
+	depends on ARCH_HAVE_ADDRENV
+	---help---
+		The architecture implements up_addrenv_deselect(), which uninstalls
+		the address environment currently instantiated on the calling CPU and
+		leaves the kernel mappings in its place.  Without it a CPU that stops
+		running user code keeps translating through the last process's page
+		tables, so those tables -- and the memory they map -- cannot be freed
+		until that CPU happens to select another address environment.
+
 config ARCH_NEED_ADDRENV_MAPPING
 	bool
 	default n

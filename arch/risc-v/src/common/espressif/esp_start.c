@@ -27,6 +27,7 @@
 #include <nuttx/config.h>
 
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stdint.h>
 
 #include <nuttx/arch.h>
@@ -56,8 +57,18 @@
 #include "soc/reg_base.h"
 #include "spi_flash_mmap.h"
 #include "rom/cache.h"
+#include "riscv/csr.h"
 #include "soc/soc.h"
 #include "soc/soc_caps.h"
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+#  include "soc/cpu_apm_reg.h"
+#  include "soc/spi_mem_s_reg.h"
+#  include "soc/tee_reg.h"
+#  ifdef CONFIG_BUILD_KERNEL
+#    include "esp32s31_mm_init.h"
+#  endif
+#endif
 #ifdef CONFIG_ARCH_CHIP_ESP32P4
 #  include "soc/hp_peri_pms_reg.h"
 #  include "soc/lp_peri_pms_reg.h"
@@ -150,6 +161,11 @@
 
 #define NAPOT_RWX   (PMPCFG_A_NAPOT | PMPCFG_RWX_MASK)
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+#  define ESP32S31_CPU_APM_REE0_RWX 0x7
+#endif
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -182,6 +198,15 @@ extern int ets_printf(const char *fmt, ...) printf_like(1, 2);
 
 extern void cache_set_idrom_mmu_size(uint32_t irom_size, uint32_t drom_size);
 extern void ets_delay_us(uint32_t us);
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+extern noreturn_function void esp32s31_start_smode(void (*entry)(void));
+#endif
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && defined(CONFIG_ESP32S31_SMP)
+#  include "../../esp32s31/esp32s31_cpu1_boot.h"
+#endif
 
 /****************************************************************************
  * Private Function Prototypes
@@ -240,6 +265,8 @@ static int map_rom_segments(uint32_t app_drom_start, uint32_t app_drom_vaddr,
   uint32_t app_irom_vaddr_aligned = app_irom_vaddr & MMU_FLASH_MASK;
   uint32_t app_drom_start_aligned = app_drom_start & MMU_FLASH_MASK;
   uint32_t app_drom_vaddr_aligned = app_drom_vaddr & MMU_FLASH_MASK;
+  uint32_t app_irom_map_size;
+  uint32_t app_drom_map_size;
 #ifdef CONFIG_ESPRESSIF_SIMPLE_BOOT
   esp_image_header_t image_header; /* Header for entire image */
   esp_image_segment_header_t WORD_ALIGNED_ATTR segment_hdr;
@@ -251,7 +278,6 @@ static int map_rom_segments(uint32_t app_drom_start, uint32_t app_drom_vaddr,
 #endif
 
 #ifdef CONFIG_ESPRESSIF_SIMPLE_BOOT
-
   /* Read image header */
 
   if (bootloader_flash_read(offset, &image_header,
@@ -337,6 +363,11 @@ static int map_rom_segments(uint32_t app_drom_start, uint32_t app_drom_vaddr,
       if (ram_segments == image_header.segment_count && !padding_checksum)
         {
           offset += (CHECKSUM_ALIGN - 1) - (offset % CHECKSUM_ALIGN) + 1;
+          if (image_header.hash_appended)
+            {
+              offset += ESP_IMAGE_HASH_LEN;
+            }
+
           padding_checksum = true;
         }
     }
@@ -351,6 +382,15 @@ static int map_rom_segments(uint32_t app_drom_start, uint32_t app_drom_vaddr,
 
   cache_hal_disable(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_ALL);
 
+  /* The MMU mappings start at page-aligned virtual addresses.  Include the
+   * segment's leading page offset so a non-aligned segment does not lose its
+   * final page when the payload crosses a page boundary. */
+
+  app_irom_map_size = app_irom_size +
+                      (app_irom_vaddr - app_irom_vaddr_aligned);
+  app_drom_map_size = app_drom_size +
+                      (app_drom_vaddr - app_drom_vaddr_aligned);
+
   /* Clear the MMU entries that are already set up,
    * so the new app only has the mappings it creates.
    */
@@ -359,23 +399,26 @@ static int map_rom_segments(uint32_t app_drom_start, uint32_t app_drom_vaddr,
 
   mmu_hal_map_region(0, MMU_TARGET_FLASH0,
                      app_drom_vaddr_aligned, app_drom_start_aligned,
-                     app_drom_size, &actual_mapped_len);
+                     app_drom_map_size, &actual_mapped_len);
 
   mmu_hal_map_region(0, MMU_TARGET_FLASH0,
                      app_irom_vaddr_aligned, app_irom_start_aligned,
-                     app_irom_size, &actual_mapped_len);
+                     app_irom_map_size, &actual_mapped_len);
 
   /* ------------------Enable corresponding buses--------------------- */
 
   cache_bus_mask_t bus_mask = cache_ll_l1_get_bus(0, app_drom_vaddr_aligned,
-                                                  app_drom_size);
+                                                  app_drom_map_size);
   cache_ll_l1_enable_bus(0, bus_mask);
-  bus_mask = cache_ll_l1_get_bus(0, app_irom_vaddr_aligned, app_irom_size);
+  bus_mask = cache_ll_l1_get_bus(0, app_irom_vaddr_aligned,
+                                 app_irom_map_size);
   cache_ll_l1_enable_bus(0, bus_mask);
 #if CONFIG_ESPRESSIF_NUM_CPUS > 1
-  bus_mask = cache_ll_l1_get_bus(1, app_drom_vaddr_aligned, app_drom_size);
+  bus_mask = cache_ll_l1_get_bus(1, app_drom_vaddr_aligned,
+                                 app_drom_map_size);
   cache_ll_l1_enable_bus(1, bus_mask);
-  bus_mask = cache_ll_l1_get_bus(1, app_irom_vaddr_aligned, app_irom_size);
+  bus_mask = cache_ll_l1_get_bus(1, app_irom_vaddr_aligned,
+                                 app_irom_map_size);
   cache_ll_l1_enable_bus(1, bus_mask);
 #endif
 
@@ -448,7 +491,14 @@ extern void esp_chip_revision_check(void);
 
 void weak_function riscv_soc_initialize(void)
 {
+#ifndef CONFIG_ARCH_CHIP_ESP32S31
   sys_startup_fn();
+#else
+  /* The S31 IDF startup list assumes the ESP-IDF application startup
+   * sequence.  NuttX initializes the required clocks and devices through
+   * its architecture and driver startup paths instead.
+   */
+#endif
 }
 
 /****************************************************************************
@@ -474,6 +524,156 @@ void sys_startup_fn(void)
   SYS_STARTUP_FN();
 }
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+
+/****************************************************************************
+ * Name: esp32s31_mmode_fault
+ ****************************************************************************/
+
+noreturn_function void esp32s31_mmode_fault(uint32_t cause, uint32_t epc,
+                                             uint32_t tval,
+                                             const uint32_t *regs)
+{
+  ets_printf("\nS31SM:M-TRAP mcause=0x%08" PRIx32
+             " mepc=0x%08" PRIx32 " mtval=0x%08" PRIx32
+             " sscratch=0x%08" PRIx32 " sepc=0x%08" PRIx32
+             " scause=0x%08" PRIx32 " sstatus=0x%08" PRIx32 "\n",
+             cause, epc, tval, (uint32_t)READ_CSR(CSR_SCRATCH),
+             (uint32_t)READ_CSR(CSR_EPC),
+             (uint32_t)READ_CSR(CSR_CAUSE),
+             (uint32_t)READ_CSR(CSR_STATUS));
+  ets_printf("S31SM:FAULT-REGS a0=0x%08" PRIx32
+             " a1=0x%08" PRIx32 " a2=0x%08" PRIx32
+             " a3=0x%08" PRIx32 " a4=0x%08" PRIx32
+             " a5=0x%08" PRIx32 " a6=0x%08" PRIx32
+             " a7=0x%08" PRIx32 " ra=0x%08" PRIx32
+             " sp=0x%08" PRIx32 "\n",
+             regs[0], regs[1], regs[2], regs[3], regs[4],
+             regs[5], regs[6], regs[7], regs[8], regs[9]);
+  ets_printf("S31SM:CPU-APM filter=0x%08" PRIx32
+             " r0_attr=0x%08" PRIx32 " m1_status=0x%08" PRIx32
+             " m1_info0=0x%08" PRIx32 " m1_addr=0x%08" PRIx32 "\n",
+             REG_READ(CPU_APM_REGION_FILTER_EN_REG),
+             REG_READ(CPU_APM_REGION0_ATTR_REG),
+             REG_READ(CPU_APM_M1_STATUS_REG),
+             REG_READ(CPU_APM_M1_EXCEPTION_INFO0_REG),
+             REG_READ(CPU_APM_M1_EXCEPTION_INFO1_REG));
+  ets_printf("S31SM:PMA7 cfg=0x%08" PRIx32 " addr=0x%08" PRIx32 "\n",
+             (uint32_t)RV_READ_CSR(CSR_PMACFG(7)),
+             (uint32_t)RV_READ_CSR(CSR_PMAADDR(7)));
+  ets_printf("S31SM:PMP cfg0=0x%08" PRIx32 " addr0=0x%08" PRIx32
+             " psram_pms0=0x%08" PRIx32 " psram_reject=0x%08" PRIx32
+             "\n", (uint32_t)READ_CSR(CSR_PMPCFG0),
+             (uint32_t)READ_CSR(CSR_PMPADDR0),
+             REG_READ(SPI_SMEM_S_PMS0_ATTR_REG),
+             REG_READ(SPI_MEM_S_PMS_REJECT_REG));
+  ets_printf("S31SM:machine mstatus=0x%08" PRIx32
+             " misa=0x%08" PRIx32 " medeleg=0x%08" PRIx32
+             " mideleg=0x%08" PRIx32 " satp=0x%08" PRIx32
+             " tee_spriv=0x%08" PRIx32 "\n",
+             (uint32_t)RV_READ_CSR(mstatus),
+             (uint32_t)RV_READ_CSR(misa),
+             (uint32_t)RV_READ_CSR(medeleg),
+             (uint32_t)RV_READ_CSR(mideleg),
+             (uint32_t)RV_READ_CSR(satp),
+             REG_READ(TEE_SUPERVISOR_PRIV_SEL_REG));
+
+  for (; ; )
+    {
+      __asm__ volatile ("wfi");
+    }
+}
+
+/****************************************************************************
+ * Name: esp32s31_prepare_hart_smode
+ ****************************************************************************/
+
+void IRAM_ATTR esp32s31_prepare_hart_smode(void)
+{
+  /* PMA CSRs are private to each hart.  ROM leaves PMA15 as one broad RX
+   * cache window over Flash and PSRAM.  Replace it on every core with
+   * separate Flash RX and PSRAM RWX apertures before that core enters
+   * S-mode.  Sv32 remains responsible for per-page U/S and W^X policy.
+   */
+
+  PMA_ENTRY_CFG_RESET(15);
+  PMA_RESET_AND_ENTRY_SET_NAPOT(6, SOC_IROM_LOW,
+                                SOC_IROM_HIGH - SOC_IROM_LOW,
+                                PMA_NAPOT | PMA_L | PMA_EN |
+                                PMA_R | PMA_X);
+  PMA_RESET_AND_ENTRY_SET_NAPOT(7, SOC_EXTRAM_LOW, SOC_EXTRAM_SIZE,
+                                PMA_NAPOT | PMA_L | PMA_EN |
+                                PMA_R | PMA_W | PMA_X);
+  __asm__ volatile ("fence rw, rw" ::: "memory");
+  __asm__ volatile ("fence.i" ::: "memory");
+}
+
+/****************************************************************************
+ * Name: esp32s31_prepare_smode
+ ****************************************************************************/
+
+static void esp32s31_prepare_smode(void)
+{
+  uint32_t tee_supervisor;
+  uint32_t apm_region0;
+
+#ifdef CONFIG_ESP32S31_SMP
+  /* CPU1 is bus master M1.  Its reset security mode is REE2, which cannot
+   * execute the cached kernel image protected for TEE/REE0.  Classify M1
+   * like CPU0's M0 before release; supervisor_priv_sel below still keeps
+   * S-mode privileged and U-mode subject to the REE0 and Sv32 permissions. */
+
+  REG_CLR_BIT(TEE_M1_MODE_CTRL_REG, TEE_M1_MODE_M);
+#endif
+
+  /* Treat S-mode as the privileged SoC execution environment while keeping
+   * U-mode in the unprivileged environment selected by the Sv32 page tables.
+   */
+
+  tee_supervisor = REG_READ(TEE_SUPERVISOR_PRIV_SEL_REG);
+#ifdef CONFIG_ESP32S31_SMP
+  tee_supervisor |= TEE_CORE1_SUPERVISOR_PRIV_SEL;
+#endif
+  REG_WRITE(TEE_SUPERVISOR_PRIV_SEL_REG,
+            tee_supervisor | TEE_CORE0_SUPERVISOR_PRIV_SEL);
+
+  /* The reset-time CPU APM region covers the cached Flash/PSRAM windows, but
+   * REE0 starts with no permissions.  Allow the S-mode kernel to use the
+   * already initialized cache path; Sv32 later applies W^X and U permissions.
+   */
+
+  apm_region0 = REG_READ(CPU_APM_REGION0_ATTR_REG);
+  REG_WRITE(CPU_APM_REGION0_ATTR_REG,
+            apm_region0 | ESP32S31_CPU_APM_REE0_RWX);
+
+  esp32s31_prepare_hart_smode();
+}
+
+void esp32s31_smode_irq_drop(int cpuint)
+{
+  register uint32_t a0 __asm__("a0") = 4;
+  register uint32_t a1 __asm__("a1") = (uint32_t)cpuint;
+
+  __asm__ volatile ("ecall"
+                    : "+r"(a0), "+r"(a1)
+                    :
+                    : "a2", "a3", "a4", "a5", "a6", "a7",
+                      "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+                      "memory");
+}
+
+static void esp32s31_nx_start_smode(void)
+{
+#ifdef CONFIG_BUILD_KERNEL
+  esp32s31_mm_init();
+#endif
+
+  nx_start();
+}
+
+#endif
+
 /****************************************************************************
  * Name: __esp_start
  ****************************************************************************/
@@ -481,6 +681,10 @@ void sys_startup_fn(void)
 void __esp_start(void)
 {
   esp_err_t ret;
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE) && defined(CONFIG_ESP32S31_SMP)
+  uintptr_t cpu0_percpu;
+#endif
 
   esp_cpu_intr_set_ivt_addr(&_vector_table);
 
@@ -494,15 +698,29 @@ void __esp_start(void)
 
 #ifdef CONFIG_ESP_ROM_NEEDS_SET_CACHE_MMU_SIZE
   uint32_t _instruction_size;
+  uint32_t instruction_page_offset;
   uint32_t cache_mmu_irom_size;
 #endif
 
   bootloader_clear_bss_section();
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE) && defined(CONFIG_ESP32S31_SMP) && \
+    defined(CONFIG_RISCV_PERCPU_SCRATCH)
+  /* CONFIG_SMP makes the HAL's startup locks query this_cpu().  Establish
+   * CPU0's scratch area before bootloader_init() reaches any such lock.
+   * Some later ROM/HAL calls reset supervisor CSRs, so retain the pointer
+   * and restore it immediately before entering S-mode. */
+
+  riscv_percpu_add_hart(0);
+  cpu0_percpu = READ_CSR(CSR_SCRATCH);
+#endif
+
 #ifdef CONFIG_ESPRESSIF_SIMPLE_BOOT
-  if (bootloader_init() != 0)
+  ret = bootloader_init();
+  if (ret != 0)
     {
-      ets_printf("Hardware init failed, aborting\n");
+      ets_printf("Hardware init failed, aborting: %d (0x%x)\n", ret, ret);
       while (true);
     }
 #endif
@@ -510,7 +728,10 @@ void __esp_start(void)
   /* Initialize the per CPU areas */
 
 #ifdef CONFIG_RISCV_PERCPU_SCRATCH
+#  if !defined(CONFIG_ARCH_CHIP_ESP32S31) || \
+      !defined(CONFIG_ARCH_USE_S_MODE)
   riscv_percpu_add_hart(0);
+#  endif
 #endif
 
 #if defined(CONFIG_ESPRESSIF_BOOTLOADER_MCUBOOT) || \
@@ -534,8 +755,12 @@ void __esp_start(void)
 #if CONFIG_ESP_ROM_NEEDS_SET_CACHE_MMU_SIZE
   _instruction_size = (uint32_t)&_instruction_reserved_end - \
                       (uint32_t)&_instruction_reserved_start;
+  instruction_page_offset =
+      (uint32_t)&_instruction_reserved_start &
+      (SPI_FLASH_MMU_PAGE_SIZE - 1);
   cache_mmu_irom_size =
-      ((_instruction_size + SPI_FLASH_MMU_PAGE_SIZE - 1) / \
+      ((instruction_page_offset + _instruction_size +
+        SPI_FLASH_MMU_PAGE_SIZE - 1) / \
       SPI_FLASH_MMU_PAGE_SIZE) * sizeof(uint32_t);
 
   /* Configure the Cache MMU size for instruction and rodata in flash. */
@@ -565,6 +790,15 @@ void __esp_start(void)
   spi_flash_init_chip_state();
 
   esp_mmu_map_init();
+
+#if CONFIG_ESP_ROM_NEEDS_SET_CACHE_MMU_SIZE
+  /* esp_mmu_map_init() applies ESP-IDF's size-only calculation again.  NuttX
+   * starts IROM at a non-page-aligned address, so restore the offset-aware
+   * instruction-page count after that initialization. */
+
+  cache_set_idrom_mmu_size(cache_mmu_irom_size,
+                           CACHE_DROM_MMU_MAX_END - cache_mmu_irom_size);
+#endif
 
 #ifdef CONFIG_ESPRESSIF_SPIRAM
   ret = esp_psram_chip_init();
@@ -602,8 +836,22 @@ void __esp_start(void)
 #ifdef CONFIG_ESPRESSIF_SPIRAM_MEMTEST
   if (esp_psram_is_initialized() && !esp_psram_extram_test())
     {
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+      ets_printf("PSRAM failure: APM status=0x%08" PRIx32
+                 " info0=0x%08" PRIx32 " addr=0x%08" PRIx32
+                 " PMS=0x%08" PRIx32 " PMA7=0x%08" PRIx32
+                 "/0x%08" PRIx32 "\n",
+                 REG_READ(CPU_APM_M1_STATUS_REG),
+                 REG_READ(CPU_APM_M1_EXCEPTION_INFO0_REG),
+                 REG_READ(CPU_APM_M1_EXCEPTION_INFO1_REG),
+                 REG_READ(SPI_MEM_S_PMS_REJECT_REG),
+                 (uint32_t)RV_READ_CSR(CSR_PMACFG(7)),
+                 (uint32_t)RV_READ_CSR(CSR_PMAADDR(7)));
+#endif
       PANIC();
     }
+
 #endif
 
 #ifdef CONFIG_ESPRESSIF_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
@@ -622,12 +870,20 @@ void __esp_start(void)
 
   /* Configure the UART so we can get debug output */
 
+#ifndef CONFIG_ARCH_CHIP_ESP32S31
   esp_lowsetup();
+#else
+  /* The S31 bootloader already configured the console.  Defer the full
+   * NuttX UART setup until up_initialize(), after scheduler primitives exist.
+   */
+#endif
 
 #ifdef USE_EARLYSERIALINIT
   /* Perform early serial initialization */
 
+#ifndef CONFIG_ARCH_CHIP_ESP32S31
   riscv_earlyserialinit();
+#endif
 #endif
 
   esp_chip_revision_check();
@@ -659,7 +915,52 @@ void __esp_start(void)
 
   showprogress("D");
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  esp32s31_prepare_smode();
+#  ifdef CONFIG_ESP32S31_SMP
+  {
+    uint32_t cpu1_hartid;
+    uint32_t cpu1_state;
+
+    ret = esp32s31_cpu1_boot(&cpu1_hartid, &cpu1_state);
+    if (ret < 0)
+      {
+        ets_printf("\nCPU1 bring-up failed: ret=%d hart=%u state=0x%08x\n",
+                   ret, (unsigned int)cpu1_hartid,
+                   (unsigned int)cpu1_state);
+        PANIC();
+      }
+  }
+#  endif
+#  ifdef CONFIG_RISCV_PERCPU_SCRATCH
+  /* Some ROM/HAL initialization paths reset supervisor CSRs.  Install the
+   * NuttX sscratch/per-CPU pointer only after all of them have completed and
+   * immediately before entering S-mode.
+   */
+
+#    ifdef CONFIG_ESP32S31_SMP
+  WRITE_CSR(CSR_SCRATCH, cpu0_percpu);
+  UP_DSB();
+#    else
+  riscv_percpu_add_hart(0);
+#    endif
+#  endif
+  esp32s31_start_smode(esp32s31_nx_start_smode);
+#else
+#  ifdef CONFIG_ARCH_FPU
+  /* The supervisor entry path enables the FPU while building its first
+   * context frame.  A flat build never goes through it, so the unit has to
+   * be turned on here or the first context save traps.
+   */
+
+  riscv_fpuconfig();
+  showprogress("E");
+#  endif
+
+  showprogress("F");
   nx_start();
+#endif
 
   UNUSED(ret);
 

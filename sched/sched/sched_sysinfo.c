@@ -49,11 +49,8 @@
 int sysinfo(FAR struct sysinfo *info)
 {
 #ifndef CONFIG_SCHED_CPULOAD_NONE
-  struct cpuload_s cpuload =
-  {
-    0,
-    0
-  };
+  clock_t active = 0;
+  clock_t total = 0;
 
 #endif
 #ifdef CONFIG_MM_PGALLOC
@@ -69,16 +66,41 @@ int sysinfo(FAR struct sysinfo *info)
       memset(info, 0, sizeof(*info));
 
 #ifndef CONFIG_SCHED_CPULOAD_NONE
-      clock_cpuload(0, &cpuload);
+#ifdef CONFIG_SMP
+      struct cpuload_s cpuloads[CONFIG_SMP_NCPUS];
+      int i;
 
-      /* On the simulator, you may hit cpuload.total == 0, but probably never
+      for (i = 0; i < CONFIG_SMP_NCPUS; i++)
+        {
+          if (clock_cpuload(i, &cpuloads[i]) >= 0)
+            {
+              active += cpuloads[i].active;
+            }
+        }
+
+      total = cpuloads[0].total;
+#else
+      struct cpuload_s cpuload;
+
+      if (clock_cpuload(0, &cpuload) >= 0)
+        {
+          active = cpuload.active;
+          total = cpuload.total;
+        }
+#endif
+
+      /* On the simulator, you may hit total == 0, but probably never
        * on real hardware.
        */
 
-      if (cpuload.total)
+      if (total)
         {
-          info->loads[0] = ((cpuload.total - cpuload.active) <<
-                            SI_LOAD_SHIFT) / cpuload.total;
+          if (active > total)
+            {
+              active = total;
+            }
+
+          info->loads[0] = ((total - active) << SI_LOAD_SHIFT) / total;
           info->loads[1] = info->loads[0];
           info->loads[2] = info->loads[0];
         }

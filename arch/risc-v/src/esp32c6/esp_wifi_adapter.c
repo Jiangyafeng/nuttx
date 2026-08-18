@@ -43,6 +43,7 @@
 #include <irq/irq.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/mqueue.h>
+#include <nuttx/semaphore.h>
 #include <nuttx/spinlock.h>
 #include <nuttx/irq.h>
 #include <nuttx/mutex.h>
@@ -57,8 +58,10 @@
 
 #include "esp_irq.h"
 #include "esp_hr_timer.h"
+#include "esp_start.h"
 
 #include "esp_types.h"
+#include "esp_idf_version.h"
 #include "esp_random.h"
 #include "esp_mac.h"
 #include "esp_intr_alloc.h"
@@ -84,6 +87,14 @@
 #if SOC_PM_MODEM_RETENTION_BY_REGDMA
 #include "esp_private/esp_regdma.h"
 #include "esp_private/sleep_retention.h"
+#endif
+
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+#include "hal/regi2c_ctrl_ll.h"
+
+/* Defined by esp_phy/src/phy_override.c, which has no public header. */
+
+extern void include_esp_phy_override(void);
 #endif
 
 #include "esp_wlan_netdev.h"
@@ -148,6 +159,10 @@ static void set_intr_wrapper(int32_t cpu_no, uint32_t intr_source,
                              uint32_t intr_num, int32_t intr_prio);
 static void clear_intr_wrapper(uint32_t intr_source, uint32_t intr_num);
 static void set_isr_wrapper(int32_t n, void *f, void *arg);
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+static void wifi_s31_isr_wrapper(void *arg);
+#endif
 static void enable_intr_wrapper(uint32_t intr_mask);
 static void disable_intr_wrapper(uint32_t intr_mask);
 static bool is_from_isr_wrapper(void);
@@ -250,6 +265,19 @@ static int coex_schm_flexible_period_set_wrapper(uint8_t period);
 static uint8_t coex_schm_flexible_period_get_wrapper(void);
 static void esp_empty_wrapper(void);
 
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+static void *coex_schm_get_phase_by_idx_wrapper(int phase_idx);
+static int coex_configure_preemption_end_cb_wrapper(bool is_register,
+                                                     int (*cb)(uint32_t));
+static bool esp_wifi_disable_ac_ax_wrapper(void);
+static void regdma_link_set_write_wait_content_wrapper(void *link,
+                                                        uint32_t addr,
+                                                        uint32_t value);
+static void *sleep_retention_find_link_by_id_wrapper(int id);
+static int32_t wifi_sleep_retention_attach_wrapper(void);
+static int32_t wifi_sleep_retention_detach_wrapper(void);
+#endif
+
 /* Second block of functions
  * These functions are auxiliary functions that are used by the first block
  * of functions or software adapters for the Wi-Fi driver
@@ -306,6 +334,30 @@ extern void wifi_apb80m_release(void);
  * Private Data
  ****************************************************************************/
 
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+static intr_handler_t g_wifi_s31_vendor_isr;
+static void *g_wifi_s31_vendor_isr_arg;
+#endif
+
+/****************************************************************************
+ * Private Functions
+ ****************************************************************************/
+
+/* A flat build exposes the kernel allocators as macros, which cannot be taken
+ * as function pointers, so the adapter tables need real functions.
+ */
+
+static void *esp_wifi_malloc_wrapper(size_t size)
+{
+  return kmm_malloc(size);
+}
+
+static void esp_wifi_free_wrapper(void *ptr)
+{
+  kmm_free(ptr);
+}
+
 /****************************************************************************
  * Public Data
  ****************************************************************************/
@@ -323,7 +375,7 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
   ._ints_off = disable_intr_wrapper,
   ._is_from_isr = is_from_isr_wrapper,
   ._spin_lock_create = esp_coex_common_spin_lock_create_wrapper,
-  ._spin_lock_delete = free,
+  ._spin_lock_delete = esp_wifi_free_wrapper,
   ._wifi_int_disable = esp_coex_common_int_disable_wrapper,
   ._wifi_int_restore = esp_coex_common_int_restore_wrapper,
   ._task_yield_from_isr = esp_coex_common_task_yield_from_isr_wrapper,
@@ -357,8 +409,8 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
   ._task_ms_to_tick = task_ms_to_tick_wrapper,
   ._task_get_current_task = task_get_current_task_wrapper,
   ._task_get_max_priority = task_get_max_priority_wrapper,
-  ._malloc = malloc,
-  ._free = free,
+  ._malloc = esp_wifi_malloc_wrapper,
+  ._free = esp_wifi_free_wrapper,
   ._event_post = esp_event_post_wrapper,
   ._get_free_heap_size = esp_get_free_heap_size,
   ._rand = esp_random,
@@ -366,8 +418,19 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
       esp_empty_wrapper,
   ._dport_access_stall_other_cpu_end_wrap =
       esp_empty_wrapper,
+  /* ESP-IDF v6.2 renamed these two slots from _wifi_apb80m_* to
+   * _wifi_pm_sleep_lock_*.  Only the names changed: the offsets, the adapter
+   * version and the behaviour the blob expects are all unchanged.
+   */
+
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && \
+    ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+  ._wifi_pm_sleep_lock_acquire = wifi_apb80m_request_wrapper,
+  ._wifi_pm_sleep_lock_release = wifi_apb80m_release_wrapper,
+#else
   ._wifi_apb80m_request = wifi_apb80m_request_wrapper,
   ._wifi_apb80m_release = wifi_apb80m_release_wrapper,
+#endif
   ._phy_disable = esp_phy_disable_wrapper,
   ._phy_enable = esp_phy_enable_wrapper,
   ._phy_update_country_info = esp_phy_update_country_info,
@@ -433,8 +496,33 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
   ._coex_schm_register_cb = coex_schm_register_cb_wrapper,
   ._coex_schm_flexible_period_set = coex_schm_flexible_period_set_wrapper,
   ._coex_schm_flexible_period_get = coex_schm_flexible_period_get_wrapper,
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+  ._regdma_link_set_write_wait_content =
+      regdma_link_set_write_wait_content_wrapper,
+  ._sleep_retention_find_link_by_id =
+      sleep_retention_find_link_by_id_wrapper,
+  ._coex_schm_get_phase_by_idx = coex_schm_get_phase_by_idx_wrapper,
+  ._coex_configure_preemption_end_cb =
+      coex_configure_preemption_end_cb_wrapper,
+  ._wifi_disable_ac_ax = esp_wifi_disable_ac_ax_wrapper,
+  ._wifi_bb_sleep_retention_attach = wifi_sleep_retention_attach_wrapper,
+  ._wifi_bb_sleep_retention_detach = wifi_sleep_retention_detach_wrapper,
+  ._wifi_mac_sleep_retention_attach = wifi_sleep_retention_attach_wrapper,
+  ._wifi_mac_sleep_retention_detach = wifi_sleep_retention_detach_wrapper,
+#endif
   ._magic = ESP_WIFI_OS_ADAPTER_MAGIC,
 };
+
+/* The current supplicant asks the driver whether PMK caching must be
+ * bypassed.  E.1 uses the normal cache path and has no fast-transition
+ * policy that would require bypassing it. */
+
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+bool esp_wifi_skip_supp_pmkcaching(void)
+{
+  return false;
+}
+#endif
 
 /****************************************************************************
  * Private Functions
@@ -464,7 +552,7 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
 
 static IRAM_ATTR void *wifi_zalloc_wrapper(size_t size)
 {
-  return zalloc(size);
+  return kmm_zalloc(size);
 }
 
 /****************************************************************************
@@ -668,8 +756,30 @@ static void IRAM_ATTR clear_intr_wrapper(uint32_t intr_source,
 
 static void set_isr_wrapper(int32_t n, void *f, void *arg)
 {
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  g_wifi_s31_vendor_isr = (intr_handler_t)f;
+  g_wifi_s31_vendor_isr_arg = arg;
+  intr_handler_set(n, wifi_s31_isr_wrapper, NULL);
+#else
   intr_handler_set(n, (intr_handler_t)f, arg);
+#endif
 }
+
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+static void IRAM_ATTR wifi_s31_isr_wrapper(void *arg)
+{
+  UNUSED(arg);
+
+  if (g_wifi_s31_vendor_isr != NULL)
+    {
+      g_wifi_s31_vendor_isr(g_wifi_s31_vendor_isr_arg);
+    }
+
+  esp32s31_smode_irq_ack(1);
+}
+#endif
 
 /****************************************************************************
  * Name: enable_intr_wrapper
@@ -691,7 +801,8 @@ static void enable_intr_wrapper(uint32_t intr_mask)
   int cpuint = __builtin_ffs(intr_mask) - 1;
   int irq = esp_cpuint_to_irq(cpuint, this_cpu());
 
-  wlinfo("intr_mask=%08lx cpuint=%d irq=%d\n", intr_mask, cpuint, irq);
+  wlinfo("intr_mask=%08lx cpuint=%d irq=%d\n",
+         (unsigned long)intr_mask, cpuint, irq);
 
   esprv_int_enable(intr_mask);
 }
@@ -718,7 +829,13 @@ static void disable_intr_wrapper(uint32_t intr_mask)
 
   wlinfo("intr_mask=%08lx cpuint=%d irq=%d\n", intr_mask, cpuint, irq);
 
-  up_disable_irq(irq);
+  /* The Wi-Fi binary passes a CPU-interrupt mask here, not a peripheral
+   * source IRQ.  Keep this symmetric with enable_intr_wrapper(): routing a
+   * peripheral source to the allocator's disabled line would make the later
+   * esprv_int_enable() unable to reconnect it.
+   */
+
+  esprv_int_disable(intr_mask);
 }
 
 /****************************************************************************
@@ -1223,6 +1340,14 @@ static int32_t task_create_pinned_to_core_wrapper(void *entry,
       target_prio += task_get_max_priority_wrapper() - ESP_MAX_PRIORITIES;
     }
 
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+  if (target_prio >= nxsched_self()->sched_priority &&
+      nxsched_self()->sched_priority > 1)
+    {
+      target_prio = nxsched_self()->sched_priority - 1;
+    }
+#endif
+
   pid = kthread_create(name, target_prio, stack_depth, entry,
                        (char * const *)param);
   if (pid > 0)
@@ -1419,8 +1544,27 @@ static void IRAM_ATTR wifi_apb80m_release_wrapper(void)
 
 static void esp_phy_enable_wrapper(void)
 {
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+  /* The bootloader leaves the analog I2C master on the reset-time XTAL source
+   * because its 160 MHz source is not available while ROM loads NuttX.  The
+   * clock tree is ready here, so select and reset the source expected by PHY
+   * calibration before enabling the radio.
+   */
+
+  regi2c_ctrl_ll_master_configure_clock();
+  _regi2c_ctrl_ll_master_reset();
+
+  /* libphy resolves its system hooks to weak stubs unless this is called.  The
+   * die-temperature hook is the one that matters for the radio: without it the
+   * PHY compensates its RF settings against a temperature it never read.
+   */
+
+  include_esp_phy_override();
+#endif
+
   esp_phy_enable(PHY_MODEM_WIFI);
   phy_wifi_enable_set(1);
+
 }
 
 /****************************************************************************
@@ -1837,7 +1981,7 @@ static void coex_disable_wrapper(void)
 static IRAM_ATTR uint32_t coex_status_get_wrapper(void)
 {
 #if CONFIG_SW_COEXIST_ENABLE || CONFIG_EXTERNAL_COEX_ENABLE
-  return coex_status_get();
+  return coex_status_get(COEX_STATUS_GET_WIFI_BITMAP);
 #else
   return 0;
 #endif
@@ -2254,6 +2398,55 @@ static uint8_t coex_schm_flexible_period_get_wrapper(void)
 static void IRAM_ATTR esp_empty_wrapper(void)
 {
 }
+
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+/* Stage E.1 intentionally disables Wi-Fi power save and all radio
+ * coexistence modes.  ABI v9 still requires these S31 slots to be present;
+ * keep them explicit and inert until modem retention is enabled in a later
+ * power-management stage.
+ */
+
+static void *coex_schm_get_phase_by_idx_wrapper(int phase_idx)
+{
+#if CONFIG_SW_COEXIST_ENABLE || CONFIG_EXTERNAL_COEX_ENABLE
+  return coex_schm_get_phase_by_idx(phase_idx);
+#else
+  return NULL;
+#endif
+}
+
+static int coex_configure_preemption_end_cb_wrapper(bool is_register,
+                                                     int (*cb)(uint32_t))
+{
+  return OK;
+}
+
+static bool esp_wifi_disable_ac_ax_wrapper(void)
+{
+  return false;
+}
+
+static void regdma_link_set_write_wait_content_wrapper(void *link,
+                                                        uint32_t addr,
+                                                        uint32_t value)
+{
+}
+
+static void *sleep_retention_find_link_by_id_wrapper(int id)
+{
+  return NULL;
+}
+
+static int32_t wifi_sleep_retention_attach_wrapper(void)
+{
+  return 1;
+}
+
+static int32_t wifi_sleep_retention_detach_wrapper(void)
+{
+  return 1;
+}
+#endif
 
 /****************************************************************************
  * Name: esp_get_free_heap_size
@@ -2934,7 +3127,7 @@ void *xsemaphore_create_counting_adapter(uint32_t max, uint32_t init)
 
 IRAM_ATTR void *wifi_malloc(size_t size)
 {
-  return malloc(size);
+  return kmm_malloc(size);
 }
 
 /****************************************************************************
@@ -2954,7 +3147,7 @@ IRAM_ATTR void *wifi_malloc(size_t size)
 
 IRAM_ATTR void *wifi_realloc(void *ptr, size_t size)
 {
-  return realloc(ptr, size);
+  return kmm_realloc(ptr, size);
 }
 
 /****************************************************************************
@@ -2974,5 +3167,5 @@ IRAM_ATTR void *wifi_realloc(void *ptr, size_t size)
 
 IRAM_ATTR void *wifi_calloc(size_t n, size_t size)
 {
-  return calloc(n, size);
+  return kmm_calloc(n, size);
 }

@@ -33,6 +33,13 @@
 #include "riscv_internal.h"
 #include "riscv_percpu.h"
 
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+#  include "esp_attr.h"
+#  define RISCV_CPUINDEX_ATTR IRAM_ATTR
+#else
+#  define RISCV_CPUINDEX_ATTR
+#endif
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -45,7 +52,7 @@
  *
  ****************************************************************************/
 
-int up_cpu_index(void)
+RISCV_CPUINDEX_ATTR int up_cpu_index(void)
 {
   return riscv_percpu_get_hartid();
 }

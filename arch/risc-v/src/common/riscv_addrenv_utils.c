@@ -85,7 +85,7 @@ uintptr_t riscv_get_pgtable(arch_addrenv_t *addrenv, uintptr_t vaddr)
     {
       /* No page table has been allocated... allocate one now */
 
-      paddr = mm_pgalloc(1);
+      paddr = riscv_pgtable_alloc();
       if (paddr)
         {
           /* Determine page table flags */
@@ -140,6 +140,8 @@ int riscv_map_pages(arch_addrenv_t *addrenv, uintptr_t *pages,
   uintptr_t ptlast;
   uintptr_t ptlevel;
   uintptr_t paddr;
+  uintptr_t vstart = vaddr;
+  size_t mapped = (size_t)npages * MM_PGSIZE;
 
   ptlevel =  RV_MMU_PT_LEVELS;
 
@@ -165,6 +167,8 @@ int riscv_map_pages(arch_addrenv_t *addrenv, uintptr_t *pages,
   /* Flush the data cache, so the changes are committed to memory */
 
   UP_DMB();
+
+  riscv_tlb_shootdown_range(vstart, mapped);
 
   return OK;
 }
@@ -194,6 +198,8 @@ int riscv_unmap_pages(arch_addrenv_t *addrenv, uintptr_t vaddr,
   uintptr_t ptprev;
   uintptr_t ptlevel;
   uintptr_t paddr;
+  uintptr_t vstart = vaddr;
+  size_t unmapped = (size_t)npages * MM_PGSIZE;
 
   ptlevel =  ARCH_SPGTS;
   ptprev  =  riscv_pgvaddr(addrenv->spgtables[ARCH_SPGTS - 1]);
@@ -226,6 +232,8 @@ int riscv_unmap_pages(arch_addrenv_t *addrenv, uintptr_t vaddr,
   /* Flush the data cache, so the changes are committed to memory */
 
   UP_DMB();
+
+  riscv_tlb_shootdown_range(vstart, unmapped);
 
   return OK;
 }

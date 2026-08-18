@@ -86,7 +86,14 @@ int net_sem_timedwait2(FAR sem_t *sem, bool interruptible,
       blresult2 = nxrmutex_breaklock(mutex2, &count2);
     }
 
-  /* Now take the semaphore, waiting if so requested. */
+  /* Now take the semaphore, waiting if so requested.
+   *
+   * Do not mask signals around an uninterruptible wait, tempting as it is to
+   * stop the retry loop from spinning while a signal stays pending.  Waking
+   * on the signal is how a task blocked here ever gets terminated:  the
+   * default action is taken when the task next runs, and a task that cannot
+   * be woken cannot be killed.
+   */
 
   if (timeout != UINT_MAX)
     {
@@ -115,16 +122,31 @@ int net_sem_timedwait2(FAR sem_t *sem, bool interruptible,
         }
     }
 
-  /* Recover the network lock at the proper count (if we held it before) */
+  /* Recover the network lock at the proper count (if we held it before).
+   *
+   * A failure here cannot be recovered by the caller, which resumes believing
+   * it still holds these locks: the next unlock would underflow the recursive
+   * count and break mutual exclusion for every other holder of the same lock.
+   */
 
   if (blresult2 >= 0)
     {
-      nxrmutex_restorelock(mutex2, count2);
+      blresult2 = nxrmutex_restorelock(mutex2, count2);
+      if (blresult2 < 0)
+        {
+          _err("ERROR: cannot restore device lock %p: %d\n",
+               mutex2, blresult2);
+        }
     }
 
   if (blresult1 >= 0)
     {
-      nxrmutex_restorelock(mutex1, count1);
+      blresult1 = nxrmutex_restorelock(mutex1, count1);
+      if (blresult1 < 0)
+        {
+          _err("ERROR: cannot restore connection lock %p: %d\n",
+               mutex1, blresult1);
+        }
     }
 
   return ret;

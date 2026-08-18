@@ -113,6 +113,15 @@ static int elf_loadbinary(FAR struct binary_s *binp,
       goto errout_with_init;
     }
 
+#ifdef CONFIG_ELF_APP_VERIFY
+  ret = elf_verify_app(filename, &loadinfo);
+  if (ret < 0)
+    {
+      berr("Application verification rejected %s: %d\n", filename, ret);
+      goto errout_with_init;
+    }
+#endif
+
 #ifdef CONFIG_SCHED_USER_IDENTITY
   /* Save IDs and mode from file system before loading segments */
 

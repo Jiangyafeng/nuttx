@@ -31,6 +31,9 @@
 
 #include <nuttx/config.h>
 
+#include <assert.h>
+#include <debug.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -86,6 +89,21 @@ static inline uintptr_t riscv_pgvaddr(uintptr_t paddr)
 }
 #endif /* CONFIG_ARCH_PGPOOL_MAPPING */
 
+/* Some SoCs cannot reliably walk page tables through their cached external
+ * memory aperture.  Keep page-table allocation distinct from process-page
+ * allocation so the architecture can select an internal table store.
+ */
+
+#ifdef CONFIG_ARCH_CHIP_ESP32S31
+uintptr_t esp32s31_pgtable_alloc(void);
+void esp32s31_pgtable_free(uintptr_t paddr);
+#  define riscv_pgtable_alloc()       esp32s31_pgtable_alloc()
+#  define riscv_pgtable_free(paddr)   esp32s31_pgtable_free(paddr)
+#else
+#  define riscv_pgtable_alloc()       mm_pgalloc(1)
+#  define riscv_pgtable_free(paddr)   mm_pgfree(paddr, 1)
+#endif
+
 /****************************************************************************
  * Name: riscv_uservaddr
  *
@@ -122,6 +140,19 @@ static inline bool riscv_uservaddr(uintptr_t vaddr)
 static inline void riscv_pgwipe(uintptr_t paddr)
 {
   uintptr_t vaddr = riscv_pgvaddr(paddr);
+
+  /* A page outside every mapped window has no virtual address here, and
+   * wiping it would clear page zero instead, turning an allocator problem
+   * into an unrelated fault far away from its cause.
+   */
+
+  if (vaddr == 0)
+    {
+      _alert("ERROR: unmappable page %" PRIxPTR " from %p\n",
+             paddr, __builtin_return_address(0));
+      PANIC();
+    }
+
   memset((void *)vaddr, 0, MM_PGSIZE);
 }
 

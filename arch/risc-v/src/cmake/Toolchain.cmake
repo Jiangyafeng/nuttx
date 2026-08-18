@@ -37,7 +37,9 @@ endif()
 
 # Default toolchain
 
-if(CONFIG_ARCH_TOOLCHAIN_CLANG)
+if(CONFIG_ARCH_CHIP_ESP32S31)
+  set(TOOLCHAIN_PREFIX riscv32-esp-elf)
+elseif(CONFIG_ARCH_TOOLCHAIN_CLANG)
   set(TOOLCHAIN_PREFIX riscv64-unknown-elf)
 else()
   find_program(RV_COMPILER riscv-none-elf-gcc)

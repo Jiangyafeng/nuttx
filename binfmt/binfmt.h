@@ -56,6 +56,12 @@ extern "C"
 
 EXTERN FAR struct binfmt_s *g_binfmts;
 
+#ifdef CONFIG_ELF_APP_VERIFY
+struct mod_loadinfo_s;
+int elf_verify_app(FAR const char *filename,
+                   FAR struct mod_loadinfo_s *loadinfo);
+#endif
+
 /****************************************************************************
  * Public Function Prototypes
  ****************************************************************************/

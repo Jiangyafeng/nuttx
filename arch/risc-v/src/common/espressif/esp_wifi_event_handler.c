@@ -140,6 +140,7 @@ static void esp_reconnect_work_cb(void *arg)
 static void esp_wifi_event_handler(void *arg, esp_event_base_t event_base,
                                    int32_t event_id, void *event_data)
 {
+  bool net_locked;
   int ret;
   struct wifi_notify *notify;
   wifi_ps_type_t ps_type = DEFAULT_PS_MODE;
@@ -150,10 +151,19 @@ static void esp_wifi_event_handler(void *arg, esp_event_base_t event_base,
   /* Some of the following logic (eg. esp_wlan_sta_set_linkstatus)
    * can take net_lock(). To maintain the consistent locking order,
    * we take net_lock() here before taking esp_wifi_lock. Note that
-   * net_lock() is a recursive lock.
+   * net_lock() is a recursive lock.  Scan completion is the exception:
+   * SIOCGIWSCAN waits for scan_signal while the network ioctl path owns
+   * net_lock(), so taking it here would deadlock the event that releases
+   * that waiter.  Scan parsing changes no network-interface state and only
+   * needs the Wi-Fi exclusion lock.
    */
 
-  net_lock();
+  net_locked = event_id != WIFI_EVENT_SCAN_DONE;
+  if (net_locked)
+    {
+      net_lock();
+    }
+
   esp_wifi_lock(true);
 
   switch (event_id)
@@ -265,7 +275,10 @@ static void esp_wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 
   esp_wifi_lock(false);
-  net_unlock();
+  if (net_locked)
+    {
+      net_unlock();
+    }
 }
 
 /****************************************************************************

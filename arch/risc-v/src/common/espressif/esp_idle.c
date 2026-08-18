@@ -54,6 +54,11 @@
 
 #include "esp_sleep.h"
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+extern volatile uint32_t g_esp32s31_machine_forward_mask[2];
+#endif
+
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -235,6 +240,28 @@ void up_idle(void)
   /* This would be an appropriate place to put some MCU-specific logic to
    * sleep in a reduced power mode until an interrupt occurs to save power
    */
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  /* A M-only CLIC source may have arrived while SIE was clear in the syscall
+   * return path.  Once the scheduler has installed the complete idle-task
+   * context it is safe to release that deferred source before WFI.
+   */
+
+  esp32s31_smode_irq_reenable();
+
+  /* A level-triggered source can be re-deferred while its S-mode handler is
+   * running with SIE clear.  Never execute WFI while the monitor still has
+   * all such wake sources masked.  Return to the idle loop and release one
+   * more batch on the next iteration instead of replaying a periodic tick in
+   * a tight inner loop.
+   */
+
+  if (g_esp32s31_machine_forward_mask[up_cpu_index()] != 0)
+    {
+      return;
+    }
+#endif
 
   esp_pm_impl_idle_hook();
   esp_pm_impl_waiti();

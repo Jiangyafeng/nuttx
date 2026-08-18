@@ -26,13 +26,23 @@
 
 #include <inttypes.h>
 #include <assert.h>
+#include <errno.h>
 #include <nuttx/debug.h>
 #include <math.h>
+
+#include <psa/crypto.h>
 
 #include "esp_mac.h"
 #include "esp_wifi_types_generic.h"
 #include "esp_wifi.h"
 #include "esp_private/wifi.h"
+
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+#  include <sched.h>
+#  include "esp_crypto_clk.h"
+#  include "private/esp_coexist_adapter.h"
+#  include "private/esp_coexist_internal.h"
+#endif
 
 #include "esp_wifi_utils.h"
 #include "esp_wifi_api.h"
@@ -121,8 +131,56 @@ int esp_wifi_api_adapter_deinit(void)
 
 int esp_wifi_api_adapter_init(void)
 {
+  psa_status_t psa_status;
   int ret;
   wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && defined(CONFIG_ESP32S31_SMP)
+  cpu_set_t saved_affinity;
+  cpu_set_t cpu0_affinity;
+  int affinity_errno = 0;
+#endif
+
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+  /* Current S31 ESP-IDF runs esp_security_init() at SECONDARY priority 103,
+   * selecting and enabling the 240 MHz PLL for clk_sec before PSA and Wi-Fi
+   * start.  The NuttX boot path deliberately skips IDF's startup table, so
+   * reproduce the complete clock initialization for the Wi-Fi CCMP path.
+   */
+
+  esp_crypto_clk_init();
+
+  /* ESP-IDF also registers and pre-initializes coexistence from its startup
+   * function table.  S31 needs this even in Wi-Fi-only builds because the
+   * coexistence firmware supplies the WDEVAX priority tables used by HE. */
+
+  ret = esp_coex_adapter_register(&g_coex_adapter_funcs);
+  if (ret != ESP_OK)
+    {
+      wlerr("Failed to register coexistence adapter: %d\n", ret);
+      return esp_wifi_to_errno(ret);
+    }
+
+  ret = coex_pre_init();
+  if (ret != ESP_OK)
+    {
+      wlerr("Failed to pre-initialize coexistence: %d\n", ret);
+      return esp_wifi_to_errno(ret);
+    }
+
+#endif
+
+  /* ESP-IDF normally initializes PSA Crypto from its SECONDARY startup
+   * function table.  NuttX does not run that table, while the vendor WPA
+   * supplicant uses PSA for HMAC-SHA1 during the four-way handshake.  Make
+   * the dependency explicit before any supplicant operation can use it.
+   */
+
+  psa_status = esp_psa_crypto_init();
+  if (psa_status != PSA_SUCCESS)
+    {
+      wlerr("Failed to initialize PSA Crypto: %ld\n", (long)psa_status);
+      return -EIO;
+    }
 
   esp_wifi_lock(true);
 
@@ -139,8 +197,14 @@ int esp_wifi_api_adapter_init(void)
 
 #ifdef CONFIG_ESPRESSIF_WIFI_AMPDU_RX_ENABLED
   wifi_cfg.ampdu_rx_enable = 1;
+  wifi_cfg.rx_ba_win       = CONFIG_ESPRESSIF_WIFI_RX_BA_WIN;
 #else
+  /* CONFIG_ESPRESSIF_WIFI_RX_BA_WIN only exists while AMPDU RX is selected,
+   * and the vendor driver ignores the window when aggregation is disabled.
+   */
+
   wifi_cfg.ampdu_rx_enable = 0;
+  wifi_cfg.rx_ba_win       = 0;
 #endif
 
 #ifdef CONFIG_ESPRESSIF_WIFI_STA_DISCONNECT_PM
@@ -149,14 +213,96 @@ int esp_wifi_api_adapter_init(void)
   wifi_cfg.sta_disconnected_pm = false;
 #endif
 
-  wifi_cfg.rx_ba_win          = CONFIG_ESPRESSIF_WIFI_TX_BA_WIN;
   wifi_cfg.static_rx_buf_num  = CONFIG_ESPRESSIF_WIFI_STATIC_RX_BUFFER_NUM;
-  wifi_cfg.static_tx_buf_num  = CONFIG_ESPRESSIF_WIFI_STATIC_TX_BUFFER_NUM;
+
+  /* ESP-IDF only counts static transmit buffers when the transmit buffers are
+   * static; asking for both leaves the blob with a buffer budget no ESP-IDF
+   * build ever presents it with.
+   */
+
+  wifi_cfg.static_tx_buf_num  =
+    CONFIG_ESPRESSIF_WIFI_TX_BUFFER_TYPE == 0 ?
+    CONFIG_ESPRESSIF_WIFI_STATIC_TX_BUFFER_NUM : 0;
+
   wifi_cfg.dynamic_rx_buf_num = CONFIG_ESPRESSIF_WIFI_DYNAMIC_RX_BUFFER_NUM;
   wifi_cfg.dynamic_tx_buf_num = CONFIG_ESPRESSIF_WIFI_DYNAMIC_TX_BUFFER_NUM;
   wifi_cfg.tx_buf_type        = CONFIG_ESPRESSIF_WIFI_TX_BUFFER_TYPE;
 
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+  /* WIFI_INIT_CONFIG_DEFAULT() derives feature_caps from CONFIG_ESP_WIFI_*
+   * symbols that NuttX does not provide, so the blob is told far less than it
+   * is told under ESP-IDF.  Advertise the same capability set the IDF default
+   * build uses on S31: WPA3-SAE, GMAC, enterprise, BSS max idle and OWE.
+   */
+
+  wifi_cfg.feature_caps |= CONFIG_FEATURE_WPA3_SAE_BIT |
+                           CONFIG_FEATURE_GMAC_BIT |
+                           CONFIG_FEATURE_WIFI_ENT_BIT |
+                           CONFIG_FEATURE_BSS_MAX_IDLE_BIT |
+                           CONFIG_FEATURE_OWE_SOFTAP_BIT;
+#endif
+
+#ifdef CONFIG_IDF_TARGET_ESP32S31
+  {
+    struct sched_param sp;
+    int saved_prio;
+
+#ifdef CONFIG_ESP32S31_SMP
+    /* The NuttX Wi-Fi task adapter creates a kernel thread before applying
+     * the requested affinity.  In SMP the new thread inherits its creator's
+     * mask and could otherwise execute vendor code on an idle CPU1 before
+     * it is pinned.  Keep the complete Wi-Fi task tree on CPU0 from its
+     * first instruction; G.2.0 has no address-environment shootdown or
+     * cache-off protocol for moving these services to CPU1.
+     */
+
+    if (sched_getaffinity(0, sizeof(saved_affinity),
+                         &saved_affinity) < 0)
+      {
+        ret = -errno;
+        goto errout_init_wifi;
+      }
+
+    CPU_ZERO(&cpu0_affinity);
+    CPU_SET(0, &cpu0_affinity);
+    if (sched_setaffinity(0, sizeof(cpu0_affinity),
+                         &cpu0_affinity) < 0)
+      {
+        ret = -errno;
+        goto errout_init_wifi;
+      }
+#endif
+
+    sched_getparam(0, &sp);
+    saved_prio = sp.sched_priority;
+    sp.sched_priority = SCHED_PRIORITY_MAX;
+    sched_setparam(0, &sp);
+    ret = esp_wifi_init(&wifi_cfg);
+    sp.sched_priority = saved_prio;
+    sched_setparam(0, &sp);
+
+#ifdef CONFIG_ESP32S31_SMP
+    if (sched_setaffinity(0, sizeof(saved_affinity),
+                         &saved_affinity) < 0)
+      {
+        affinity_errno = errno;
+      }
+#endif
+  }
+#else
   ret = esp_wifi_init(&wifi_cfg);
+#endif
+
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && defined(CONFIG_ESP32S31_SMP)
+  if (affinity_errno != 0)
+    {
+      wlerr("Failed to restore Wi-Fi initializer affinity: %d\n",
+            affinity_errno);
+      ret = -affinity_errno;
+      goto errout_init_wifi;
+    }
+#endif
+
   if (ret)
     {
       wlerr("Failed to initialize Wi-Fi error=%d\n", ret);
@@ -664,6 +810,13 @@ int esp_wifi_sta_read_mac(uint8_t *mac)
   return esp_wifi_to_errno(ret);
 }
 
+static bool esp_wifi_sta_is_associated(void)
+{
+  wifi_ap_record_t ap_info;
+
+  return esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+}
+
 /****************************************************************************
  * Name: esp_wifi_sta_set_password
  *
@@ -720,11 +873,20 @@ int esp_wifi_sta_password(struct iwreq *iwr, bool set)
           return esp_wifi_to_errno(ret);
         }
 
-      ret = esp_wifi_sta_disconnect(true);
-      if (ret)
+      /* Reconfiguring credentials is an intentional disconnect.  Do not
+       * let the disconnect event schedule an asynchronous reconnect with a
+       * half-updated configuration; SIOCSIWESSID will explicitly connect
+       * after both the credentials and SSID have been installed.
+       */
+
+      if (esp_wifi_sta_is_associated())
         {
-          wlerr("Failed to disconnect from Wi-Fi AP ret=%d\n", ret);
-          return ret;
+          ret = esp_wifi_sta_disconnect(false);
+          if (ret)
+            {
+              wlerr("Failed to disconnect from Wi-Fi AP ret=%d\n", ret);
+              return ret;
+            }
         }
     }
   else
@@ -836,11 +998,20 @@ int esp_wifi_sta_essid(struct iwreq *iwr, bool set)
       memset(wifi_cfg.sta.sae_h2e_identifier, 0x0, SAE_H2E_IDENTIFIER_LEN);
       wifi_cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
-      ret = esp_wifi_sta_disconnect(true);
-      if (ret)
+      /* Keep the reconfiguration sequence single-threaded.  The wireless
+       * upper half calls esp_wlan_connect() immediately after this setter
+       * for IW_ESSID_ON, so an event-worker reconnect here would race that
+       * explicit connection and could use the previous SSID.
+       */
+
+      if (esp_wifi_sta_is_associated())
         {
-          wlerr("Failed to disconnect from Wi-Fi AP ret=%d\n", ret);
-          return ret;
+          ret = esp_wifi_sta_disconnect(false);
+          if (ret)
+            {
+              wlerr("Failed to disconnect from Wi-Fi AP ret=%d\n", ret);
+              return ret;
+            }
         }
 
       ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
@@ -916,11 +1087,16 @@ int esp_wifi_sta_bssid(struct iwreq *iwr, bool set)
           return esp_wifi_to_errno(ret);
         }
 
-      ret = esp_wifi_sta_disconnect(true);
-      if (ret)
+      /* A BSSID update is also an intentional reconfiguration. */
+
+      if (esp_wifi_sta_is_associated())
         {
-          wlerr("Failed to connect to Wi-Fi AP ret=%d\n", ret);
-          return ret;
+          ret = esp_wifi_sta_disconnect(false);
+          if (ret)
+            {
+              wlerr("Failed to disconnect from Wi-Fi AP ret=%d\n", ret);
+              return ret;
+            }
         }
     }
   else

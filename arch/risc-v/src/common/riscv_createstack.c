@@ -27,6 +27,7 @@
 #include <nuttx/config.h>
 
 #include <sys/types.h>
+#include <errno.h>
 #include <stdint.h>
 #include <sched.h>
 #include <assert.h>
@@ -88,10 +89,11 @@ int up_create_stack(struct tcb_s *tcb, size_t stack_size, uint8_t ttype)
    * TLS feature.
    */
 
-  DEBUGASSERT(stack_size <= TLS_MAXSTACK);
-  if (stack_size >= TLS_MAXSTACK)
+  if (stack_size > TLS_MAXSTACK)
     {
-      stack_size = TLS_MAXSTACK;
+      serr("ERROR: Requested stack %zu exceeds TLS maximum %ld\n",
+           stack_size, TLS_MAXSTACK);
+      return -E2BIG;
     }
 #endif
 

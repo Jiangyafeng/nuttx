@@ -138,12 +138,6 @@ exception_common:
   addi       sp, sp, -XCPTCONTEXT_SIZE
   save_ctx   sp
 
-  /* Save the extended context */
-
-#ifdef CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS
-  save_extctx sp
-#endif
-
   csrr       s0, CSR_STATUS       /* s0=status */
   csrr       s1, CSR_EPC          /* s1=exception PC */
   csrr       s2, CSR_CAUSE        /* s2=cause */
@@ -158,6 +152,14 @@ exception_common:
   REGSTORE   s0, REG_INT_CTX(sp)
   REGSTORE   s1, REG_EPC(sp)
   REGSTORE   s3, REG_SP(sp)
+
+  /* Save architecture-specific integer state after REG_INT_CTX is valid.
+   * CLIC targets derive xcause's xret fields from that saved status.
+   */
+
+#ifdef CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS
+  save_extctx sp
+#endif
 
 #ifdef CONFIG_LIB_SYSCALL
   csrr       tp, CSR_SCRATCH      /* Load kernel TP */
@@ -305,10 +307,29 @@ return_from_exception:
 1:
 #endif
 
-  /* Restore the extended context */
-
 #ifdef CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS
+  /* Restore architecture-specific integer state at the last possible point
+   * before the general registers and xret.  On ESP32-S31 this includes the
+   * complete CLIC scause return state.  Restoring it earlier would select
+   * the wrong task's state after a context switch.
+   */
+
   load_extctx sp
+#endif
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+  /* The S31's external CLIC inputs are owned by the M-mode monitor.  A
+   * conventional sret leaves a short interval in which an M-only input can
+   * observe S-mode after this frame is committed but before its SIE state is
+   * restored.  Restore the complete register set first and let the monitor
+   * perform both S-to-S and S-to-U returns atomically.
+   */
+
+  csrr       t0, CSR_STATUS
+  andi       t0, t0, STATUS_PPP
+  beqz       t0, .Lesp32s31_user_return
+  j          .Lesp32s31_supervisor_return
 #endif
 
   load_ctx   sp
@@ -318,6 +339,40 @@ return_from_exception:
   /* Return from exception */
 
   ERET
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+.Lesp32s31_supervisor_return:
+  load_ctx   sp
+  REGLOAD    sp, REG_SP(sp)
+
+  /* The monitor recognizes this exact PC without consuming an argument
+   * register.  It either turns one deferred input into a trap from the
+   * selected S-mode frame or completes the final privilege return.  The
+   * former eventually reaches this gate again and drains the next input.
+   */
+
+  .global esp32s31_supervisor_return_ecall
+esp32s31_supervisor_return_ecall:
+  ecall
+  unimp
+
+.Lesp32s31_user_return:
+  load_ctx   sp
+  REGLOAD    sp, REG_SP(sp)
+
+  /* esp32s31_machine_trap recognizes this exact S-mode ecall site without
+   * using an argument register, so every general register already contains
+   * the value that U-mode must observe.  The monitor either forwards one
+   * deferred input from this complete user frame or returns directly to the
+   * user EPC saved in sepc.  It never returns to the instruction below.
+   */
+
+  .global esp32s31_user_return_ecall
+esp32s31_user_return_ecall:
+  ecall
+  unimp
+#endif
   .cfi_endproc
 
 /****************************************************************************
@@ -354,6 +409,31 @@ riscv_jump_to_user:
   li       a1, ~STATUS_PPP
   and      a0, a0, a1
   REGSTORE a0, REG_INT_CTX(sp)
+
+  /* Keep the architecture-specific state created by
+   * riscv_initial_extctx_state().  In particular, ESP32-S31 must retain the
+   * supervisor-originated CLIC interrupt reason and previous level for this
+   * first S-to-U return; rebuilding all of it after clearing sstatus.SPP
+   * stalls the new user task.
+   */
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS)
+  /* The one field that must not survive is the CLIC previous-privilege bit.
+   * xret on this CLIC takes the privilege it restores from the cause
+   * register, so a frame whose sstatus.SPP now says U but whose XPP still
+   * says S returns to S-mode and immediately takes an instruction page fault
+   * on the first user-mode address, with status.SPP reported as S.  Whether
+   * that happens depends on which privilege the trap that scheduled this
+   * thread came from, which is why it shows up as a cross-core race.
+   */
+
+  REGLOAD  a1, REG_S31_CLIC_CAUSE(sp)
+  li       a2, ~S31_CLIC_CAUSE_XPPS
+  and      a1, a1, a2
+  REGSTORE a1, REG_S31_CLIC_CAUSE(sp)
+#endif
+
   mv       a0, sp
   tail return_from_exception
 

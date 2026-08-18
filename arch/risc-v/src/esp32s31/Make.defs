@@ -1,0 +1,38 @@
+############################################################################
+# arch/risc-v/src/esp32s31/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+############################################################################
+
+include common/Make.defs
+include common/espressif/Make.defs
+
+CHIP_CSRCS += esp_chip_rev.c
+
+ifeq ($(CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS),y)
+CHIP_CSRCS += esp32s31_intctx.c
+endif
+
+ifeq ($(CONFIG_ARCH_USE_S_MODE),y)
+CHIP_ASRCS += esp32s31_supervisor.S
+CHIP_CSRCS += esp32s31_monstat.c
+endif
+
+ifeq ($(CONFIG_ESP32S31_SMP),y)
+CHIP_ASRCS += esp32s31_cpu1_boot.S
+CHIP_CSRCS += esp32s31_cpu1_boot.c
+endif
+
+ifeq ($(CONFIG_ESP32S31_SMP),y)
+CHIP_CSRCS += esp32s31_smp.c
+endif
+
+ifeq ($(CONFIG_ESP32S31_SMP_TLB_SHOOTDOWN),y)
+CHIP_CSRCS += esp32s31_tlb.c
+endif
+
+ifeq ($(CONFIG_BUILD_KERNEL),y)
+CHIP_CSRCS += esp32s31_mm_init.c esp32s31_pgalloc.c
+endif
+
+CFLAGS += ${DEFINE_PREFIX}_RETARGETABLE_LOCKING

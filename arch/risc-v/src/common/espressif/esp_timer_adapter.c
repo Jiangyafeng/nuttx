@@ -35,9 +35,9 @@
 
 #include "esp_timer.h"
 #include "esp_timer_adapter.h"
-
 #include "esp_private/esp_timer_private.h"
 #include "esp_timer_impl.h"
+#include "rom/ets_sys.h"
 
 /****************************************************************************
  * Private Types
@@ -482,6 +482,12 @@ int esp_hr_timer_init(void)
     }
 
   /* Initialize the timer subsystem */
+
+  ret = esp_timer_early_init();
+  if (ret != ESP_OK)
+    {
+      return ERROR;
+    }
 
   ret = esp_timer_init();
   if (ret == ESP_OK)

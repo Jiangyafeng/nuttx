@@ -172,7 +172,20 @@ if("${NUTTX_CONFIG}" STREQUAL "")
   message(FATAL_ERROR "Please define correct board config : ${NUTTX_CONFIG}")
 endif()
 
-if(NOT EXISTS "${NUTTX_DEFCONFIG}")
+# Allow a product repository to keep its configuration outside the NuttX
+# board tree while BOARD_CONFIG continues to select the board implementation.
+
+if(DEFINED NUTTX_CONFIG_FILE AND NOT "${NUTTX_CONFIG_FILE}" STREQUAL "")
+  get_filename_component(NUTTX_CONFIG_FILE "${NUTTX_CONFIG_FILE}" ABSOLUTE)
+  if(NOT EXISTS "${NUTTX_CONFIG_FILE}")
+    message(FATAL_ERROR "NUTTX_CONFIG_FILE not found: ${NUTTX_CONFIG_FILE}")
+  endif()
+
+  set(NUTTX_DEFCONFIG "${NUTTX_CONFIG_FILE}")
+  get_filename_component(NUTTX_CONFIG_DIR "${NUTTX_CONFIG_FILE}" DIRECTORY)
+  file(GLOB NUTTX_CONFIG_DEPENDENCIES CONFIGURE_DEPENDS
+       "${NUTTX_CONFIG_DIR}/*.conf")
+elseif(NOT EXISTS "${NUTTX_DEFCONFIG}")
   message(FATAL_ERROR "No config file found at ${NUTTX_DEFCONFIG}")
 endif()
 
@@ -349,11 +362,14 @@ if(NOT EXISTS ${NUTTX_APPS_BINDIR}/platform/board/Kconfig)
   file(TOUCH ${NUTTX_APPS_BINDIR}/platform/board/Kconfig)
 endif()
 
-# Copy board defconfig into main directory and expand TODO: do also for changes
-# in board/config (by comparing stored defconfig to specified one)
+# Copy the selected config into the build directory. Compare both its path and
+# content so edits to a config file or one of its includes refresh .config.
+
+file(SHA256 ${NUTTX_DEFCONFIG} NUTTX_DEFCONFIG_HASH)
 
 if(NOT EXISTS ${NUTTX_BINARY_DIR}/.config OR NOT "${NUTTX_DEFCONFIG}" STREQUAL
-                                             "${NUTTX_DEFCONFIG_SAVED}")
+                                             "${NUTTX_DEFCONFIG_SAVED}"
+   OR NOT "${NUTTX_DEFCONFIG_HASH}" STREQUAL "${NUTTX_DEFCONFIG_HASH_SAVED}")
 
   message(STATUS "Initializing NuttX")
   configure_file(${NUTTX_DEFCONFIG} defconfig COPYONLY)
@@ -392,6 +408,9 @@ if(NOT EXISTS ${NUTTX_BINARY_DIR}/.config OR NOT "${NUTTX_DEFCONFIG}" STREQUAL
   set(NUTTX_DEFCONFIG_SAVED
       ${NUTTX_DEFCONFIG}
       CACHE INTERNAL "Saved defconfig path" FORCE)
+  set(NUTTX_DEFCONFIG_HASH_SAVED
+      ${NUTTX_DEFCONFIG_HASH}
+      CACHE INTERNAL "Saved defconfig SHA-256" FORCE)
 
   # Print configuration choices
   message(STATUS "  CMake:  ${CMAKE_VERSION}")
@@ -706,7 +725,7 @@ else()
 endif()
 
 # initialize manifest to hold all generated files
-file(TOUCH ${NUTTX_BINARY_DIR}/nuttx.manifest)
+file(WRITE ${NUTTX_BINARY_DIR}/nuttx.manifest "")
 
 get_property(nuttx_kernel_libs GLOBAL PROPERTY NUTTX_KERNEL_LIBRARIES)
 get_property(nuttx_extra_libs GLOBAL PROPERTY NUTTX_EXTRA_LIBRARIES)

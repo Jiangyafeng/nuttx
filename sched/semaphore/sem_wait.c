@@ -40,6 +40,31 @@
 #include "semaphore/semaphore.h"
 
 /****************************************************************************
+ * Private Functions
+ ****************************************************************************/
+
+/****************************************************************************
+ * Name: nxsem_would_block
+ *
+ * Description:
+ *   Tell whether taking this counting semaphore would have to wait.  This
+ *   only peeks at the count, so the caller must still claim the semaphore
+ *   the usual way; it exists so that a decision to abort can be made before
+ *   any of the claiming side effects have to be undone.
+ *
+ * Assumptions:
+ *   Called from within a critical section.
+ *
+ ****************************************************************************/
+
+#ifndef CONFIG_DISABLE_ALL_SIGNALS
+static bool nxsem_would_block(FAR sem_t *sem)
+{
+  return atomic_read(NXSEM_COUNT(sem)) <= 0;
+}
+#endif
+
+/****************************************************************************
  * Public Functions
  ****************************************************************************/
 
@@ -96,14 +121,27 @@ int nxsem_wait_slow(FAR sem_t *sem)
    * TSTATE_WAIT_SEM. In that window, the wait cannot yet be aborted by
    * sem_wait_irq(). If sem_wait then blocks without re-checking unmasked
    * pending signals, it can sleep indefinitely and miss the interrupt.
+   *
+   * Taking a mutex is not interruptible:  POSIX has no EINTR for
+   * pthread_mutex_lock(), and callers of the recursive wrapper unlock
+   * unconditionally, so aborting here would underflow that count and break
+   * mutual exclusion for every other holder.  A holder that dies instead of
+   * unlocking is recovered by the claiming path below.
+   *
+   * For a counting semaphore, only give up when this call would really have
+   * to wait.  EINTR means the wait was interrupted, so an available count
+   * has to be handed over rather than refused.
    */
 
-  pendingset = nxsig_pendingset(rtcb);
-  nxsig_nandset(&pendingset, &pendingset, &rtcb->sigprocmask);
-  if (!sigisemptyset(&pendingset))
+  if (!mutex && nxsem_would_block(sem))
     {
-      leave_critical_section(flags);
-      return -EINTR;
+      pendingset = nxsig_pendingset(rtcb);
+      nxsig_nandset(&pendingset, &pendingset, &rtcb->sigprocmask);
+      if (!sigisemptyset(&pendingset))
+        {
+          leave_critical_section(flags);
+          return -EINTR;
+        }
     }
 #endif
 

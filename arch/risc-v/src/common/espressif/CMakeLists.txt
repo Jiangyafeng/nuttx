@@ -252,14 +252,26 @@ option(
   "Enable and use a persistent ESP third-party HAL cache directory under nuttx/../nxtmpdir"
   OFF)
 
-get_filename_component(
-  ESP_HAL_3RDPARTY_CHIP_DIR
-  "${NUTTX_BINARY_DIR}/arch/risc-v/src/common/espressif/${ESP_HAL_3RDPARTY_REPO_NAME}"
-  REALPATH)
+if(DEFINED ENV{ESP_HAL_3RDPARTY_LOCAL})
+  get_filename_component(ESP_HAL_3RDPARTY_CHIP_DIR
+                         "$ENV{ESP_HAL_3RDPARTY_LOCAL}" REALPATH)
+else()
+  get_filename_component(
+    ESP_HAL_3RDPARTY_CHIP_DIR
+    "${NUTTX_BINARY_DIR}/arch/risc-v/src/common/espressif/${ESP_HAL_3RDPARTY_REPO_NAME}"
+    REALPATH)
+endif()
 
 set(EXECUTE_CLONE_ESP_HAL_3RDPARTY_REPO TRUE)
 set(ESP_HAL_3RDPARTY_REPO "${ESP_HAL_3RDPARTY_CHIP_DIR}")
 string(REPLACE "\"" "" CHIP_SERIES "${CONFIG_ESPRESSIF_CHIP_SERIES}")
+
+if(CHIP_SERIES STREQUAL "esp32s31")
+  set(ESP_NUTTX_CHIP_INCLUDE "${NUTTX_CHIP_ABS_DIR}/include")
+else()
+  set(ESP_NUTTX_CHIP_INCLUDE
+      "${ESP_HAL_3RDPARTY_REPO}/nuttx/${CHIP_SERIES}/include")
+endif()
 
 # Here we initialize the esp-hal-3rdparty repository and its submodules. Should
 # be done only once, when CMake is configured.
@@ -323,26 +335,31 @@ if(NOT IS_DIRECTORY "${ESP_HAL_3RDPARTY_REPO}")
   file(COPY ${ESP_HAL_3RDPARTY_REPO}/components/soc/${CHIP_SERIES}/include/soc/gpio_sig_map.h
        DESTINATION ${NUTTX_BINARY_DIR}/include/arch/chip/)
 
-  file(COPY ${ESP_HAL_3RDPARTY_REPO}/nuttx/${CHIP_SERIES}/include/irq.h
+  file(COPY ${ESP_NUTTX_CHIP_INCLUDE}/irq.h
        DESTINATION ${NUTTX_BINARY_DIR}/include/arch/chip/)
 
   if(CONFIG_ESPRESSIF_WIRELESS)
     message(
       STATUS "Espressif HAL for 3rd Party Platforms: initializing submodules...")
-    execute_process(
-      COMMAND
-        git submodule --quiet update --init --depth=1 components/esp_phy/lib
-        components/esp_wifi/lib components/bt/controller/lib_esp32c3_family
-        components/bt/controller/lib_esp32c6/esp32c6-bt-lib
-        components/bt/controller/lib_esp32h2/esp32h2-bt-lib
-        components/esp_coex/lib
-      WORKING_DIRECTORY ${ESP_HAL_3RDPARTY_REPO}
-      RESULT_VARIABLE GIT_SUBMODULE_RESULT)
-    if(NOT GIT_SUBMODULE_RESULT EQUAL 0)
-      message(
-        FATAL_ERROR
-          "Failed to initialize Wi-Fi submodules. Check if the arch/risc-v/src/common/chip/ is populated and delete its contents."
-      )
+    # S31's public component snapshot intentionally has no wireless binary
+    # gitlinks.  Its independently pinned ESP_WIFI_LIB_REPO and
+    # ESP_PHY_LIB_REPO are validated by Wireless.cmake.
+    if(NOT CONFIG_ARCH_CHIP_ESP32S31)
+      execute_process(
+        COMMAND
+          git submodule --quiet update --init --depth=1 components/esp_phy/lib
+          components/esp_wifi/lib components/bt/controller/lib_esp32c3_family
+          components/bt/controller/lib_esp32c6/esp32c6-bt-lib
+          components/bt/controller/lib_esp32h2/esp32h2-bt-lib
+          components/esp_coex/lib
+        WORKING_DIRECTORY ${ESP_HAL_3RDPARTY_REPO}
+        RESULT_VARIABLE GIT_SUBMODULE_RESULT)
+      if(NOT GIT_SUBMODULE_RESULT EQUAL 0)
+        message(
+          FATAL_ERROR
+            "Failed to initialize Wi-Fi submodules. Check if the arch/risc-v/src/common/chip/ is populated and delete its contents."
+        )
+      endif()
     endif()
   endif()
 endif()
@@ -355,12 +372,15 @@ set(_irq ${NUTTX_BINARY_DIR}/include/arch/chip/irq.h)
 
 add_custom_command(
   OUTPUT ${_gpio_sig_map} ${_irq}
+  DEPENDS
+    ${ESP_HAL_3RDPARTY_REPO}/components/soc/${CHIP_SERIES}/include/soc/gpio_sig_map.h
+    ${ESP_NUTTX_CHIP_INCLUDE}/irq.h
   COMMAND
     ${CMAKE_COMMAND} -E copy
     ${ESP_HAL_3RDPARTY_REPO}/components/soc/${CHIP_SERIES}/include/soc/gpio_sig_map.h
     ${_gpio_sig_map}
   COMMAND ${CMAKE_COMMAND} -E copy
-          ${ESP_HAL_3RDPARTY_REPO}/nuttx/${CHIP_SERIES}/include/irq.h ${_irq}
+          ${ESP_NUTTX_CHIP_INCLUDE}/irq.h ${_irq}
   COMMENT "Copy esp-hal-3rdparty gpio_sig_map.h and irq.h to nuttx arch include"
   VERBATIM)
 
@@ -425,6 +445,18 @@ endif()
 
 if(CONFIG_ESPRESSIF_WIRELESS)
   include(${CMAKE_CURRENT_SOURCE_DIR}/Wireless.cmake)
+endif()
+
+# ESP-IDF initializes the S31 security clock before PSA and Wi-Fi.  NuttX does
+# not execute the IDF system-init table, so include the small clock provider
+# explicitly when the Wi-Fi stack needs the hardware CCMP path.
+
+if(CONFIG_ARCH_CHIP_ESP32S31 AND CONFIG_ESPRESSIF_WIFI)
+  list(APPEND SRCS
+       ${ESP_HAL_3RDPARTY_REPO}/components/esp_security/src/esp32s31/esp_crypto_clk.c)
+  target_include_directories(
+    arch PRIVATE
+         ${ESP_HAL_3RDPARTY_REPO}/components/esp_security/src/esp32s31)
 endif()
 
 # ##############################################################################

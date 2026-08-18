@@ -39,6 +39,7 @@
 #include <nuttx/debug.h>
 
 #include <nuttx/arch.h>
+#include <nuttx/cache.h>
 #include <nuttx/lib/elf.h>
 #include <nuttx/fs/ioctl.h>
 
@@ -754,6 +755,22 @@ int libelf_load_with_addrenv(FAR struct mod_loadinfo_s *loadinfo)
     {
       berr("ERROR: libelf_loadfile failed: %d\n", ret);
       goto errout_with_addrenv;
+    }
+
+  /* The address environment is active here and the load has just populated
+   * its text/data pages.  Fully linked ET_EXEC images skip libelf_bind(),
+   * so waiting until the bind step to make the caches coherent leaves their
+   * executable pages dirty in D-cache on non-coherent architectures.
+   */
+
+  if (loadinfo->textsize > 0)
+    {
+      up_coherent_dcache(loadinfo->textalloc, loadinfo->textsize);
+    }
+
+  if (loadinfo->datasize > 0)
+    {
+      up_coherent_dcache(loadinfo->datastart, loadinfo->datasize);
     }
 
   /* Restore the original address environment */

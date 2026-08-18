@@ -33,6 +33,10 @@
 
 #include "riscv_macros.S"
 
+#ifdef CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS
+#  include "riscv_extctx.S"
+#endif
+
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -115,6 +119,14 @@ sys_call6:
 
   addi       s0, sp, XCPTCONTEXT_SIZE
   REGSTORE   s0, REG_SP(sp)            /* original SP */
+
+#ifdef CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS
+  /* This path constructs a context frame without taking an architectural
+   * trap, so it must populate every enabled integer-extension slot too.
+   */
+
+  save_extctx_task sp
+#endif
 
   mv         a0, sp                    /* a0 = context */
 

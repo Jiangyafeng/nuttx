@@ -245,6 +245,47 @@ config ARCH_CHIP_ESP32P4
 	---help---
 		Espressif ESP32-P4 (RV32IMC).
 
+config ARCH_CHIP_ESP32S31
+	bool "ESP32-S31"
+	select ARCH_RV32
+	select ARCH_HAVE_FPU
+	select ARCH_RV_ISA_M
+	select ARCH_RV_ISA_A
+	select ARCH_RV_ISA_C
+	select ARCH_MMU_TYPE_SV32
+	select ARCH_HAVE_ADDRENV
+	select ARCH_NEED_ADDRENV_MAPPING
+	select ARCH_HAVE_S_MODE
+	select ARCH_HAVE_ELF_EXECUTABLE
+	select ARCH_ICACHE if BUILD_KERNEL
+	select ARCH_VECNOTIRQ
+	select ARCH_HAVE_BOOTLOADER if !ESPRESSIF_SIMPLE_BOOT
+	select ARCH_HAVE_I2CRESET
+	select ARCH_HAVE_MPU
+	select ARCH_HAVE_RESET
+	select ARCH_HAVE_RNG
+	select ARCH_HAVE_TICKLESS
+	select ARCH_HAVE_MULTICPU
+	select LIBC_ARCH_MEMCPY if !BUILD_KERNEL
+	select LIBC_ARCH_MEMCHR if !BUILD_KERNEL
+	select LIBC_ARCH_MEMCMP if !BUILD_KERNEL
+	select LIBC_ARCH_MEMMOVE if !BUILD_KERNEL
+	select LIBC_ARCH_MEMSET if !BUILD_KERNEL
+	select LIBC_ARCH_STRCHR if !BUILD_KERNEL
+	select LIBC_ARCH_STRCMP if !BUILD_KERNEL
+	select LIBC_ARCH_STRCPY if !BUILD_KERNEL
+	select LIBC_ARCH_STRLCPY if !BUILD_KERNEL
+	select LIBC_ARCH_STRNCPY if !BUILD_KERNEL
+	select LIBC_ARCH_STRLEN if !BUILD_KERNEL
+	select LIBC_ARCH_STRNLEN if !BUILD_KERNEL
+	select ESPRESSIF_SOC_RTC_MEM_SUPPORTED
+	select ARCH_HAVE_RAMFUNCS
+	select ONESHOT_COUNT if ONESHOT
+	select ARCH_MINIMAL_VECTORTABLE
+	---help---
+		Espressif ESP32-S31.  The initial NuttX port uses the common
+		RV32IMAC subset and leaves the vendor FPU/vector extensions disabled.
+
 config ARCH_CHIP_C906
 	bool "THEAD C906"
 	select ARCH_RV64
@@ -653,6 +694,7 @@ config ARCH_CHIP
 	default "esp32c6"               if ARCH_CHIP_ESP32C6
 	default "esp32h2"               if ARCH_CHIP_ESP32H2
 	default "esp32p4"               if ARCH_CHIP_ESP32P4
+	default "esp32s31"              if ARCH_CHIP_ESP32S31
 	default "c906"                  if ARCH_CHIP_C906
 	default "mpfs"                  if ARCH_CHIP_MPFS
 	default "rv32m1"                if ARCH_CHIP_RV32M1
@@ -697,6 +739,17 @@ config ARCH_MMU_EXT_THEAD
 	depends on ARCH_HAVE_MMU
 	---help---
 		Enable support for T-Head MMU extension.
+
+config ARCH_RV_TLB_SHOOTDOWN
+	bool
+	default n
+	depends on ARCH_HAVE_MMU
+	---help---
+		Selected by chips that implement riscv_tlb_shootdown_range() and
+		riscv_tlb_shootdown_all().  sfence.vma only reaches the issuing
+		hart, so an SMP chip must invalidate the other harts explicitly
+		after it edits a page table.  Without this the mapping paths
+		compile to nothing.
 
 config ARCH_HAVE_S_MODE
 	bool
@@ -898,6 +951,9 @@ source "arch/risc-v/src/esp32h2/Kconfig"
 endif
 if ARCH_CHIP_ESP32P4
 source "arch/risc-v/src/esp32p4/Kconfig"
+endif
+if ARCH_CHIP_ESP32S31
+source "arch/risc-v/src/esp32s31/Kconfig"
 endif
 if ARCH_CHIP_C906
 source "arch/risc-v/src/c906/Kconfig"

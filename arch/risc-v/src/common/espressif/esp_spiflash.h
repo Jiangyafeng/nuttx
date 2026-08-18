@@ -51,6 +51,21 @@ extern "C"
  ****************************************************************************/
 
 /****************************************************************************
+ * Name: esp_spiflash_init
+ *
+ * Description:
+ *   Initialize the runtime SPI Flash chip and NuttX OS hooks.  The ROM boot
+ *   path configures cache/XIP, but it does not construct the esp_flash_t
+ *   object required by the read, write and erase APIs.
+ *
+ * Returned Values:
+ *   Zero (OK) is returned or a negative error.
+ *
+ ****************************************************************************/
+
+int esp_spiflash_init(void);
+
+/****************************************************************************
  * Name: esp_spiflash_read
  *
  * Description:

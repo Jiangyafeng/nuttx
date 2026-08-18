@@ -142,6 +142,24 @@ function(nuttx_add_application)
         set(ELF_NAME "${NAME}")
         set(TARGET "ELF_${TARGET}")
         add_library(${TARGET} ${SRCS})
+
+        # The final ELF is produced by the POST_BUILD command below rather
+        # than by CMake's static-library archiver.  LINK_DEPENDS is ignored
+        # for static libraries, so use a generated empty source as a relink
+        # sentinel.  Any library consumed by the POST_BUILD command changing
+        # regenerates this source and, in turn, the archive and final ELF.
+        set(ELF_RELINK_SOURCE
+            ${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_relink.c)
+        add_custom_command(
+          OUTPUT ${ELF_RELINK_SOURCE}
+          COMMAND ${CMAKE_COMMAND} -E touch ${ELF_RELINK_SOURCE}
+          DEPENDS
+            $<GENEX_EVAL:$<TARGET_PROPERTY:nuttx_global,NUTTX_ELF_LINK_LIBRARIES>>
+            $<GENEX_EVAL:$<TARGET_PROPERTY:nuttx_global,NUTTX_ELF_LINK_EXTRA_LIBRARIES>>
+          COMMENT "Refreshing ELF relink sentinel:${ELF_NAME}"
+          COMMAND_EXPAND_LISTS)
+        target_sources(${TARGET} PRIVATE ${ELF_RELINK_SOURCE})
+
         add_dependencies(${TARGET} apps_post)
         if(TARGET STARTUP_OBJS)
           add_dependencies(${TARGET} STARTUP_OBJS)

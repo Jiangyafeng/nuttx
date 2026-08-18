@@ -1,0 +1,66 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+if ARCH_BOARD_ESP32S31_CORE_FUNCTION_BOARD
+
+config ESP32S31_SMP_TEST
+	bool "Run the G.2.0 cross-core scheduler boot diagnostic"
+	depends on ESP32S31_SMP
+	default n
+	---help---
+		Run the bounded CPU0-to-CPU1 and CPU1-to-CPU0 semaphore wakeup
+		diagnostic during board bring-up.  This is retained by the cpu1-smp
+		regression profile but omitted from normal production boots.
+
+config ESP32S31_SMP_TEST_ROUNDS
+	int "G.2.0 cross-core scheduler test rounds"
+	depends on ESP32S31_SMP_TEST
+	default 64
+	range 1 1024
+	---help---
+		Number of bounded CPU0-to-CPU1 and CPU1-to-CPU0 semaphore wakeup
+		rounds executed by the G.2.0 SMP diagnostic.
+
+config ESP32S31_FLASH_APPFS
+	bool "Load Kernel Build applications from SPI Flash AppFS"
+	depends on BUILD_KERNEL
+	select ESPRESSIF_SPIFLASH
+	select ESPRESSIF_MTD
+	select FS_ROMFS
+	select FS_LITTLEFS
+	---help---
+		Generate a read-only seed image from the separately linked Kernel
+		Build applications and place it outside the NuttX image.  The first
+		part of the configured MTD region is mounted at /system/bin as ROMFS;
+		the remainder is a writable, power-loss-resilient LittleFS mounted at
+		/apps.  No application bytes are embedded in internal SRAM.
+
+if ESP32S31_FLASH_APPFS
+
+config ESP32S31_FLASH_APPFS_SEED_SIZE
+	hex "Read-only AppFS seed partition size"
+	default 0x100000
+	---help---
+		Size of the ROMFS seed partition at the beginning of the configured
+		application MTD region.  The remaining bytes are used by LittleFS.
+
+config ESP32S31_FLASH_APPFS_SEED_INSTALL
+	bool "Install sv32test into writable AppFS on first boot"
+	default y
+	---help---
+		Atomically copy sv32test and its SHA-256 manifest from /system/bin to
+		/apps when the writable copy is absent.
+
+config ESP32S31_FLASH_APPFS_E0_CORPUS
+	bool "Include E.0 malformed-ELF validation corpus"
+	default n
+	---help---
+		Include the large oversize and malformed sv32test images used by the
+		E.0 loader validation.  Later stage images can omit this corpus while
+		retaining the normal sv32test regression application.
+
+endif
+
+endif # ARCH_BOARD_ESP32S31_CORE_FUNCTION_BOARD

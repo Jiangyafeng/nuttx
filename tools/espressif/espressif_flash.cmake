@@ -184,6 +184,33 @@ else()
          "${BINARY_DIR}/enc_mtd.bin")
   endif()
 
+  if(CONFIG_ESP32S31_FLASH_APPFS)
+    if(CONFIG_ESPRESSIF_SECURE_FLASH_ENC_ENABLED)
+      message(
+        FATAL_ERROR
+          "ESP32-S31 external appfs image encryption is not implemented")
+    endif()
+
+    set(APPFS_IMAGE "${BINARY_DIR}/appfs.img")
+    if(NOT EXISTS "${APPFS_IMAGE}")
+      message(FATAL_ERROR "ESP32-S31 appfs image not found: ${APPFS_IMAGE}")
+    endif()
+
+    file(SIZE "${APPFS_IMAGE}" APPFS_IMAGE_SIZE)
+    math(EXPR APPFS_SEED_SIZE "${CONFIG_ESP32S31_FLASH_APPFS_SEED_SIZE}")
+    math(EXPR APPFS_PARTITION_SIZE "${CONFIG_ESPRESSIF_STORAGE_MTD_SIZE}")
+    math(EXPR APPFS_SEED_ALIGNMENT "${APPFS_SEED_SIZE} % 4096")
+    if(APPFS_SEED_ALIGNMENT OR APPFS_SEED_SIZE GREATER_EQUAL APPFS_PARTITION_SIZE)
+      message(FATAL_ERROR "ESP32-S31 appfs seed must be 4 KiB aligned and smaller than its MTD partition")
+    endif()
+    if(APPFS_IMAGE_SIZE GREATER APPFS_SEED_SIZE)
+      message(FATAL_ERROR "ESP32-S31 appfs image exceeds its read-only seed region")
+    endif()
+
+    list(APPEND ESPTOOL_BINS ${CONFIG_ESPRESSIF_STORAGE_MTD_OFFSET}
+         "${APPFS_IMAGE}")
+  endif()
+
   set(WRITEFLASH_ARGS ${ESPTOOL_WRITEFLASH_ARGS} ${ESPTOOL_BINS})
 endif()
 

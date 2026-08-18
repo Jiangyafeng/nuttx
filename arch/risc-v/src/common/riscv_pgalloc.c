@@ -160,6 +160,12 @@ uintptr_t pgalloc(uintptr_t brkaddr, unsigned int npages)
 
   UP_DMB();
 
+  /* Remote harts may still cache the previous invalid translation for the
+   * newly mapped heap pages.
+   */
+
+  riscv_tlb_shootdown_range(brkaddr, (size_t)(vaddr - brkaddr));
+
   return brkaddr;
 }
 

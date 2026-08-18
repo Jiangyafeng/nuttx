@@ -66,6 +66,13 @@
 
 #define ESP_USBCDC_BUFFERSIZE 64
 
+/* How long esp_usbserial_write() waits for room in the IN endpoint.  A host
+ * services the endpoint about once per 1 ms USB frame, so this has to span
+ * several frames; it only exists so a detached host cannot block forever.
+ */
+
+#define ESP_USBCDC_TX_TIMEOUT_US 200000
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -169,12 +176,21 @@ static int esp_interrupt(int irq, void *context, void *arg)
   struct uart_dev_s *dev = (struct uart_dev_s *)arg;
   uint32_t int_status = usb_serial_jtag_ll_get_intsts_mask();
 
+  /* Release every status bit that was latched when this interrupt was taken,
+   * not just the two handled below.  The controller drives one level-
+   * triggered request out of the OR of all enabled status bits, so leaving
+   * any of them set keeps that request asserted and the handler is entered
+   * again immediately, forever.  Clearing them first also makes an event
+   * that arrives while the handler runs stay pending, which costs one extra
+   * interrupt instead of losing data.
+   */
+
+  usb_serial_jtag_ll_clr_intsts_mask(int_status);
+
   /* Send buffer has room and can accept new data. */
 
   if ((int_status & USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY) != 0)
     {
-      usb_serial_jtag_ll_clr_intsts_mask(
-        USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
       uart_xmitchars(dev);
     }
 
@@ -182,8 +198,6 @@ static int esp_interrupt(int irq, void *context, void *arg)
 
   if ((int_status & USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT) != 0)
     {
-      usb_serial_jtag_ll_clr_intsts_mask(
-        USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
       uart_recvchars(dev);
     }
 
@@ -225,7 +239,15 @@ static void esp_shutdown(struct uart_dev_s *dev)
 
 static void esp_txint(struct uart_dev_s *dev, bool enable)
 {
+  irqstate_t flags;
+
+  /* This is where a transmission ends, so it is also where the tail of the
+   * FIFO is handed to the host.  esp_send() only appends, see there.
+   */
+
+  flags = enter_critical_section();
   usb_serial_jtag_ll_txfifo_flush();
+  leave_critical_section(flags);
 
   if (enable)
     {
@@ -377,17 +399,19 @@ static bool esp_txready(struct uart_dev_s *dev)
 
 static void esp_send(struct uart_dev_s *dev, int ch)
 {
-  /* Write the character to the buffer. */
-
   uint8_t buf[1] = {
     (uint8_t)ch
   };
 
+  /* uart_xmitchars() has already established that the FIFO has room and, on
+   * SMP, holds the critical section that keeps esp_usbserial_write() on the
+   * other hart from consuming it.  So this only appends: the hardware
+   * flushes by itself once the 64 byte FIFO is full and esp_txint() flushes
+   * the tail, which keeps a burst to one USB packet instead of one per
+   * character.
+   */
+
   usb_serial_jtag_ll_write_txfifo(buf, sizeof(buf));
-
-  /* Flush the character out. */
-
-  usb_serial_jtag_ll_txfifo_flush();
 }
 
 /****************************************************************************
@@ -477,7 +501,43 @@ static int esp_ioctl(struct file *filep, int cmd, unsigned long arg)
 
 void esp_usbserial_write(char ch)
 {
-  while (!esp_txready(&g_uart_usbserial));
+  uint8_t buf[1] = {
+    (uint8_t)ch
+  };
 
-  esp_send(&g_uart_usbserial, ch);
+  irqstate_t flags;
+  uint32_t timeout;
+
+  /* syslog reaches the console through up_putc() rather than through the
+   * serial upper half, so this is a second writer of the same FIFO and on
+   * SMP it runs on either hart.  It has to take the critical section that
+   * uart_xmitchars() holds around its txready()/send() pair, otherwise it
+   * consumes the endpoint that the upper half just tested and that hart's
+   * character is discarded by write_txfifo().
+   *
+   * Nothing flow controls this path, so wait for room rather than drop, and
+   * flush right away because no upper half will mark the end of the line.
+   */
+
+  for (timeout = ESP_USBCDC_TX_TIMEOUT_US; timeout > 0; timeout--)
+    {
+      flags = enter_critical_section();
+
+      if (usb_serial_jtag_ll_txfifo_writable())
+        {
+          usb_serial_jtag_ll_write_txfifo(buf, sizeof(buf));
+          usb_serial_jtag_ll_txfifo_flush();
+          leave_critical_section(flags);
+          return;
+        }
+
+      /* Only the test and the write have to be atomic against the upper
+       * half.  Waiting for the host inside the critical section would hold
+       * interrupts off for the whole timeout on every character, which is
+       * long enough to starve the scheduler tick during a crash dump.
+       */
+
+      leave_critical_section(flags);
+      up_udelay(1);
+    }
 }

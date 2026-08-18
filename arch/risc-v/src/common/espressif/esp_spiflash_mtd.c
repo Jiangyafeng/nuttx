@@ -27,6 +27,7 @@
 #include <nuttx/config.h>
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <assert.h>
 #include <nuttx/debug.h>
 #include <stdio.h>
@@ -93,6 +94,13 @@ static ssize_t esp_bwrite(struct mtd_dev_s *dev, off_t startblock,
 static int esp_ioctl(struct mtd_dev_s *dev, int cmd,
                      unsigned long arg);
 
+static bool esp_byte_range_valid(const struct esp_mtd_dev_s *priv,
+                                 off_t offset, size_t nbytes);
+static bool esp_block_range(const struct esp_mtd_dev_s *priv,
+                            off_t startblock, size_t nblocks,
+                            size_t blocksize, uint32_t *offset,
+                            uint32_t *nbytes);
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
@@ -118,6 +126,51 @@ static const struct esp_mtd_dev_s g_esp_spiflash =
  * Private Functions
  ****************************************************************************/
 
+static bool esp_byte_range_valid(const struct esp_mtd_dev_s *priv,
+                                 off_t offset, size_t nbytes)
+{
+  uint64_t start;
+  uint64_t limit;
+
+  if (offset < 0)
+    {
+      return false;
+    }
+
+  start = (uint64_t)offset;
+  limit = (uint64_t)MTD_SIZE(priv);
+  return start <= limit && (uint64_t)nbytes <= limit - start;
+}
+
+static bool esp_block_range(const struct esp_mtd_dev_s *priv,
+                            off_t startblock, size_t nblocks,
+                            size_t blocksize, uint32_t *offset,
+                            uint32_t *nbytes)
+{
+  uint64_t start;
+  uint64_t length;
+  uint64_t limit;
+
+  if (startblock < 0 || blocksize == 0)
+    {
+      return false;
+    }
+
+  start = (uint64_t)startblock * blocksize;
+  length = (uint64_t)nblocks * blocksize;
+  limit = (uint64_t)MTD_SIZE(priv);
+
+  if (start > limit || length > limit - start ||
+      start > UINT32_MAX || length > UINT32_MAX)
+    {
+      return false;
+    }
+
+  *offset = (uint32_t)start;
+  *nbytes = (uint32_t)length;
+  return true;
+}
+
 /****************************************************************************
  * Name: esp_erase
  *
@@ -138,12 +191,12 @@ static int esp_erase(struct mtd_dev_s *dev, off_t startblock,
                      size_t nblocks)
 {
   ssize_t ret;
-  uint32_t offset = startblock * MTD_ERASE_SIZE;
-  uint32_t nbytes = nblocks * MTD_ERASE_SIZE;
+  uint32_t offset;
+  uint32_t nbytes;
   struct esp_mtd_dev_s *priv = (struct esp_mtd_dev_s *)dev;
-  irqstate_t flags;
 
-  if ((offset > MTD_SIZE(priv)) || ((offset + nbytes) > MTD_SIZE(priv)))
+  if (!esp_block_range(priv, startblock, nblocks, MTD_ERASE_SIZE,
+                       &offset, &nbytes))
     {
       return -EINVAL;
     }
@@ -182,6 +235,12 @@ static ssize_t esp_read(struct mtd_dev_s *dev, off_t offset,
                         size_t nbytes, uint8_t *buffer)
 {
   ssize_t ret;
+  struct esp_mtd_dev_s *priv = (struct esp_mtd_dev_s *)dev;
+
+  if (buffer == NULL || !esp_byte_range_valid(priv, offset, nbytes))
+    {
+      return -EINVAL;
+    }
 
   ret = esp_spiflash_read(offset, (uint32_t *)buffer, nbytes);
   if (ret == OK)
@@ -213,8 +272,16 @@ static ssize_t esp_bread(struct mtd_dev_s *dev, off_t startblock,
                          size_t nblocks, uint8_t *buffer)
 {
   ssize_t ret;
-  uint32_t addr = startblock * MTD_BLK_SIZE;
-  uint32_t size = nblocks * MTD_BLK_SIZE;
+  uint32_t addr;
+  uint32_t size;
+  struct esp_mtd_dev_s *priv = (struct esp_mtd_dev_s *)dev;
+
+  if (buffer == NULL ||
+      !esp_block_range(priv, startblock, nblocks, MTD_BLK_SIZE,
+                       &addr, &size))
+    {
+      return -EINVAL;
+    }
 
   ret = esp_spiflash_read(addr, (uint32_t *)buffer, size);
   if (ret == OK)
@@ -248,9 +315,7 @@ static ssize_t esp_write(struct mtd_dev_s *dev, off_t offset,
   ssize_t ret;
   struct esp_mtd_dev_s *priv = (struct esp_mtd_dev_s *)dev;
 
-  ASSERT(buffer);
-
-  if ((offset > MTD_SIZE(priv)) || ((offset + nbytes) > MTD_SIZE(priv)))
+  if (buffer == NULL || !esp_byte_range_valid(priv, offset, nbytes))
     {
       return -EINVAL;
     }
@@ -286,8 +351,16 @@ static ssize_t esp_bwrite(struct mtd_dev_s *dev, off_t startblock,
                           size_t nblocks, const uint8_t *buffer)
 {
   ssize_t ret;
-  uint32_t addr = startblock * MTD_BLK_SIZE;
-  uint32_t size = nblocks * MTD_BLK_SIZE;
+  uint32_t addr;
+  uint32_t size;
+  struct esp_mtd_dev_s *priv = (struct esp_mtd_dev_s *)dev;
+
+  if (buffer == NULL ||
+      !esp_block_range(priv, startblock, nblocks, MTD_BLK_SIZE,
+                       &addr, &size))
+    {
+      return -EINVAL;
+    }
 
   ret = esp_spiflash_write(addr, (uint32_t *)buffer, size);
   if (ret == OK)
@@ -403,6 +476,12 @@ struct mtd_dev_s *esp_spiflash_alloc_mtdpart(uint32_t mtd_offset,
   uint32_t startblock;
   uint32_t size;
 
+  if (esp_spiflash_init() < 0)
+    {
+      ferr("ERROR: Failed to initialize ESP SPI Flash\n");
+      return NULL;
+    }
+
   priv = &g_esp_spiflash;
 
   chip = &(*priv->data)->chip;
@@ -415,17 +494,32 @@ struct mtd_dev_s *esp_spiflash_alloc_mtdpart(uint32_t mtd_offset,
   finfo("\tSector size = %" PRId32 " KB\n", chip->sector_size / 1024);
   finfo("\tBlock size = %" PRId32 " KB\n", chip->block_size / 1024);
 
-  ASSERT((mtd_offset + mtd_size) <= chip->chip_size);
-  ASSERT((mtd_offset % chip->sector_size) == 0);
-  ASSERT((mtd_size % chip->sector_size) == 0);
-
   if (mtd_size == 0)
     {
+      if (mtd_offset > chip->chip_size)
+        {
+          ferr("ERROR: MTD offset is outside SPI Flash\n");
+          return NULL;
+        }
+
       size = chip->chip_size - mtd_offset;
     }
   else
     {
       size = mtd_size;
+    }
+
+  if (chip->sector_size == 0 || mtd_offset > chip->chip_size ||
+      size > chip->chip_size - mtd_offset ||
+      (mtd_offset % chip->sector_size) != 0 ||
+      (size % chip->sector_size) != 0 ||
+      (mtd_offset % MTD_BLK_SIZE) != 0 ||
+      (size % MTD_BLK_SIZE) != 0)
+    {
+      ferr("ERROR: Invalid MTD partition offset=0x%" PRIx32
+           " size=0x%" PRIx32 " flash=0x%" PRIx32 "\n",
+           mtd_offset, size, chip->chip_size);
+      return NULL;
     }
 
   finfo("\tMTD offset = 0x%" PRIx32 "\n", mtd_offset);
@@ -463,6 +557,11 @@ struct mtd_dev_s *esp_spiflash_mtd(void)
 {
   struct esp_mtd_dev_s *priv =
       (struct esp_mtd_dev_s *)&g_esp_spiflash;
+
+  if (esp_spiflash_init() < 0)
+    {
+      return NULL;
+    }
 
   return &priv->mtd;
 }

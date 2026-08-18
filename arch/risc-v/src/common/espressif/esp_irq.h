@@ -294,6 +294,27 @@ void esp_get_iram_interrupt_records(uint64_t *irq_count, int cpu);
 
 int esp_cpuint_to_irq(int cpuint, int cpu);
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_USE_S_MODE)
+/****************************************************************************
+ * Name: esp32s31_smode_irq_reenable
+ *
+ * Description:
+ *   Ask the S31 M-mode monitor to retry CLIC inputs that were masked while
+ *   S-mode was servicing an interrupt.
+ ****************************************************************************/
+
+void esp32s31_smode_irq_reenable(void);
+void esp32s31_smode_irq_ack(int cpuint);
+
+/* Forget a CLIC input the monitor masked, leaving it masked.  Used where the
+ * source cannot have been quieted, so that re-enabling it would storm.
+ */
+
+void esp32s31_smode_irq_drop(int cpuint);
+
+#endif
+
 #undef EXTERN
 #if defined(__cplusplus)
 }

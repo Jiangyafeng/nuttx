@@ -84,7 +84,7 @@ ESPTOOL_MIN_VERSION := 4.8.0
 
 ifdef ESPTOOL_BINDIR
 	ifeq ($(CONFIG_ESPRESSIF_BOOTLOADER_MCUBOOT),y)
-		ifeq ($(CONFIG_ARCH_CHIP_ESP32P4),y)
+		ifneq ($(filter y,$(CONFIG_ARCH_CHIP_ESP32P4) $(CONFIG_ARCH_CHIP_ESP32S31)),)
 			BL_OFFSET := 0x2000
 		else
 			BL_OFFSET := 0x0000
@@ -132,7 +132,7 @@ ifeq ($(CONFIG_ESPRESSIF_BOOTLOADER_MCUBOOT),y)
 		-H $(CONFIG_ESPRESSIF_APP_MCUBOOT_HEADER_SIZE) --pad-header \
 		-S $(CONFIG_ESPRESSIF_OTA_SLOT_SIZE)
 else ifeq ($(CONFIG_ESPRESSIF_SIMPLE_BOOT),y)
-	ifeq ($(CONFIG_ARCH_CHIP_ESP32P4),y)
+	ifneq ($(filter y,$(CONFIG_ARCH_CHIP_ESP32P4) $(CONFIG_ARCH_CHIP_ESP32S31)),)
 		APP_OFFSET := 0x2000
 	else
 		APP_OFFSET := 0x0000
@@ -257,6 +257,7 @@ define MKIMAGE
 	fi
 	$(eval ELF2IMAGE_OPTS := $(if $(CONFIG_ESPRESSIF_SIMPLE_BOOT),--ram-only-header) -fs $(FLASH_SIZE) -fm $(FLASH_MODE) -ff $(FLASH_FREQ))
 	esptool.py -c $(CHIP_SERIES) elf2image $(ELF2IMAGE_OPTS) -o nuttx.bin nuttx
+	$(if $(and $(CONFIG_ARCH_CHIP_ESP32S31),$(CONFIG_ESPRESSIF_SIMPLE_BOOT)),python3 tools/espressif/esp32s31_simple_boot_digest.py nuttx.bin)
 	$(Q) echo nuttx.bin >> nuttx.manifest
 	$(Q) echo "Generated: nuttx.bin"
 endef

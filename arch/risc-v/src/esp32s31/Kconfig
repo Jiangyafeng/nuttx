@@ -1,0 +1,56 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+if ARCH_CHIP_ESP32S31
+
+comment "ESP32-S31 Configuration Options"
+
+source "arch/risc-v/src/common/espressif/Kconfig"
+
+config ESP32S31_SMP
+	bool "Enable the ESP32-S31 two-core NuttX SMP port"
+	depends on SMP
+	depends on SMP_NCPUS = 2
+	depends on ARCH_USE_S_MODE
+	depends on ESPRESSIF_SIMPLE_BOOT
+	depends on BUILD_KERNEL
+	help
+		Start CPU1 through the ESP32-S31 per-hart M-mode monitor, release it
+		from nx_smp_start(), and use the S31 cross-core interrupt sources for
+		NuttX reschedule and SMP-call delivery.  Production enables this with
+		CONFIG_SMP_DEFAULT_CPUSET covering both harts.
+
+config ESP32S31_SMP_TLB_SHOOTDOWN
+	bool "Cross-core TLB shootdown for address environments"
+	default y
+	depends on ESP32S31_SMP
+	depends on ARCH_ADDRENV
+	select ARCH_RV_TLB_SHOOTDOWN
+	help
+		After a mapping, unmapping, permission change, or address-environment
+		destroy, invalidate remote-hart TLB entries with a generation/ack
+		mailbox delivered over the existing SMP IPI.  Required so heap grow,
+		pthread stacks, and App exit stay coherent when the same Sv32 addrenv
+		is active on more than one CPU.
+
+config ESP32S31_SMP_TLB_SHOOTDOWN_TIMEOUT_US
+	int "TLB shootdown acknowledgement timeout (microseconds)"
+	depends on ESP32S31_SMP_TLB_SHOOTDOWN
+	range 1000 5000000
+	default 500000
+
+config ESP32S31_CPU1_BOOT_TIMEOUT_US
+	int "CPU1 bring-up handshake timeout (microseconds)"
+	depends on ESP32S31_SMP
+	range 1000 5000000
+	default 500000
+
+config ESP32S31_CPU1_BOOT_STACKSIZE
+	int "CPU1 bring-up stack size"
+	depends on ESP32S31_SMP
+	range 256 4096
+	default 1024
+
+endif # ARCH_CHIP_ESP32S31

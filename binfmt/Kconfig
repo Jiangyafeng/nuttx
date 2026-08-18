@@ -60,6 +60,23 @@ config ELF_STACKSIZE
 	default DEFAULT_TASK_STACKSIZE
 	---help---
 		This is the default stack size that will be used when starting ELF binaries.
+
+config ELF_APP_VERIFY
+	bool "Verify ET_EXEC application integrity before loading"
+	default n
+	depends on ARCH_ADDRENV && BINFMT_ELF_EXECUTABLE
+	select CRYPTO
+	---help---
+		Require a hexadecimal SHA-256 sidecar named <application>.sha256 and
+		validate file length, ELF tables, PT_LOAD boundaries, W^X policy and
+		the configured text/data address-environment windows before allocating
+		any application pages.
+
+config ELF_APP_MAX_FILESIZE
+	int "Maximum verified ELF application file size"
+	default 262144
+	depends on ELF_APP_VERIFY
+	range 4096 16777216
 endif
 endif
 

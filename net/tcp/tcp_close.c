@@ -43,6 +43,16 @@
 #include "utils/utils.h"
 
 /****************************************************************************
+ * Pre-processor Definitions
+ ****************************************************************************/
+
+/* How long to wait before looking again for a connection that has lost its
+ * last reference but has not finished shutting down yet.
+ */
+
+#define TCP_CLOSE_RETRY_DELAY MSEC2TICK(100)
+
+/****************************************************************************
  * Private Functions
  ****************************************************************************/
 
@@ -53,6 +63,21 @@
 static void tcp_close_work(FAR void *param)
 {
   FAR struct tcp_conn_s *conn = (FAR struct tcp_conn_s *)param;
+
+  /* This work is queued as soon as the close is arranged, so it can run
+   * before the RST or FIN that ends the connection has actually been sent.
+   * Once the last reference is gone nothing else will ever free the
+   * connection, so the arrangement has to survive until the state machine
+   * reaches TCP_CLOSED: dropping it here orphans the connection and its
+   * callback container for the rest of the uptime.
+   */
+
+  if (conn->crefs == 0 && conn->tcpstateflags != TCP_CLOSED)
+    {
+      work_queue(LPWORK, &conn->clswork, tcp_close_work, conn,
+                 TCP_CLOSE_RETRY_DELAY);
+      return;
+    }
 
   conn->flags &= ~TCP_CLOSE_ARRANGED;
   if (conn->crefs == 0 && conn->tcpstateflags == TCP_CLOSED)

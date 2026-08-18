@@ -57,7 +57,6 @@ config TLS_NELEM
 
 config TLS_TASK_NELEM
 	int "Number of Task Local Storage elements"
-	depends on !BUILD_KERNEL
 	default 0
 	range 0 255
 	---help---

@@ -50,6 +50,9 @@ endif
 
 ifeq ($(CONFIG_ELF),y)
 CSRCS += elf.c
+ifeq ($(CONFIG_ELF_APP_VERIFY),y)
+CSRCS += elf_verify_app.c
+endif
 endif
 
 # NXFLAT application interfaces

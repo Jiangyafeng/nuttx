@@ -1298,6 +1298,31 @@ int up_addrenv_select(FAR const arch_addrenv_t *addrenv);
 #endif
 
 /****************************************************************************
+ * Name: up_addrenv_deselect
+ *
+ * Description:
+ *   Uninstall the address environment currently instantiated on the calling
+ *   CPU, leaving the kernel mappings in its place.  This is the counterpart
+ *   of up_addrenv_select() and is used when a process dies:  the CPU it last
+ *   ran on must stop translating through page tables that are about to be
+ *   freed, even if it has no other address environment to switch to.
+ *
+ *   Only kernel code may run on the CPU afterwards, until the next
+ *   up_addrenv_select().
+ *
+ * Input Parameters:
+ *   None.
+ *
+ * Returned Value:
+ *   None.
+ *
+ ****************************************************************************/
+
+#if defined(CONFIG_ARCH_ADDRENV) && defined(CONFIG_ARCH_HAVE_ADDRENV_DESELECT)
+void up_addrenv_deselect(void);
+#endif
+
+/****************************************************************************
  * Name: up_addrenv_coherent
  *
  * Description:

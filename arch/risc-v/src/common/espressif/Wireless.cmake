@@ -24,11 +24,21 @@
 # Include Paths for Wireless
 # ##############################################################################
 
+set(ESP_MBEDTLS_COMPONENT_REPO
+    ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls)
+
 target_include_directories(
   arch
   PRIVATE
     ${ESP_HAL_3RDPARTY_REPO}/components/bt/include/${CHIP_SERIES}/include
     ${ESP_HAL_3RDPARTY_REPO}/components/esp_coex/include
+    ${ESP_HAL_3RDPARTY_REPO}/components/esp_hw_support/modem/include
+    ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/include
+    ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/${CHIP_SERIES}/include
+    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/include
+    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/include/local
+    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/wifi_apps/include
+    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/wifi_apps/include/apps_private
     ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/wifi_apps/roaming_app/include
     ${ESP_HAL_3RDPARTY_REPO}/components/soc/${CHIP_SERIES}/include
     ${ESP_HAL_3RDPARTY_REPO}/nuttx/${CHIP_SERIES}/include
@@ -38,14 +48,44 @@ target_include_directories(
 # Link Libraries
 # ##############################################################################
 
+# Preview targets can receive Wi-Fi/PHY binary releases ahead of the public
+# esp-hal-3rdparty component snapshot.  Keep the binary repositories explicit
+# and independently pinnable instead of copying archives into the HAL tree.
+
+if(NOT DEFINED ESP_WIFI_LIB_REPO)
+  set(ESP_WIFI_LIB_REPO
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/lib)
+endif()
+
+if(NOT DEFINED ESP_PHY_LIB_REPO)
+  set(ESP_PHY_LIB_REPO
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/lib)
+endif()
+
+if(NOT DEFINED ESP_COEX_LIB_REPO)
+  set(ESP_COEX_LIB_REPO
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_coex/lib)
+endif()
+
+foreach(required_lib
+        ${ESP_PHY_LIB_REPO}/${CHIP_SERIES}/libphy.a
+        ${ESP_COEX_LIB_REPO}/${CHIP_SERIES}/libcoexist.a
+        ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libcore.a
+        ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libnet80211.a
+        ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libpp.a)
+  if(NOT EXISTS ${required_lib})
+    message(FATAL_ERROR "Required Espressif wireless binary missing: ${required_lib}")
+  endif()
+endforeach()
+
 nuttx_add_extra_library(
-  ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/lib/${CHIP_SERIES}/libphy.a
-  ${ESP_HAL_3RDPARTY_REPO}/components/esp_coex/lib/${CHIP_SERIES}/libcoexist.a)
+  ${ESP_PHY_LIB_REPO}/${CHIP_SERIES}/libphy.a
+  ${ESP_COEX_LIB_REPO}/${CHIP_SERIES}/libcoexist.a)
 
 if(NOT CONFIG_ARCH_CHIP_ESP32H2)
   nuttx_add_extra_library(
-    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/lib/${CHIP_SERIES}/libmesh.a
-    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/lib/${CHIP_SERIES}/libespnow.a)
+    ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libmesh.a
+    ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libespnow.a)
 endif()
 
 # ##############################################################################
@@ -125,31 +165,39 @@ if(CONFIG_ESPRESSIF_BLE)
 endif()
 
 if(CONFIG_ESPRESSIF_WIFI)
+  if(CONFIG_ARCH_CHIP_ESP32S31)
+    target_sources(
+      arch PRIVATE
+        ${ESP_HAL_3RDPARTY_REPO}/components/esp_coex/src/lib_printf.c)
+  endif()
+
   nuttx_add_extra_library(
-    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/lib/${CHIP_SERIES}/libcore.a
-    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/lib/${CHIP_SERIES}/libnet80211.a
-    ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/lib/${CHIP_SERIES}/libpp.a)
+    ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libcore.a
+    ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libnet80211.a
+    ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libpp.a)
   if(CONFIG_WPA_WAPI_PSK)
     nuttx_add_extra_library(
-      ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/lib/${CHIP_SERIES}/libwapi.a)
+      ${ESP_WIFI_LIB_REPO}/${CHIP_SERIES}/libwapi.a)
   endif()
 
   # ############################################################################
   # ESP-IDF's mbedTLS
   # ############################################################################
 
-  set(MBEDTLS_DIR ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/mbedtls)
+  set(MBEDTLS_DIR ${ESP_MBEDTLS_COMPONENT_REPO}/mbedtls)
 
   # Include directories for mbedTLS Use BEFORE so port/include and
   # builtin/include come before hal's mbedtls paths; then #include_next
   # "mbedtls/private/*.h" from port bignum.h finds builtin/include.
   target_include_directories(
     arch BEFORE
-    PRIVATE ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/include
+    PRIVATE ${ESP_MBEDTLS_COMPONENT_REPO}/port/include
+            ${MBEDTLS_DIR}/tf-psa-crypto/core
             ${MBEDTLS_DIR}/tf-psa-crypto/drivers/builtin/include
             ${MBEDTLS_DIR}/tf-psa-crypto/drivers/builtin/src
-            ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/include/aes
-            ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/psa_driver/include
+            ${MBEDTLS_DIR}/tf-psa-crypto/include
+            ${ESP_MBEDTLS_COMPONENT_REPO}/port/include/aes
+            ${ESP_MBEDTLS_COMPONENT_REPO}/port/psa_driver/include
             ${MBEDTLS_DIR}/include
             ${MBEDTLS_DIR}/library
             ${ESP_HAL_3RDPARTY_REPO}/nuttx/include/mbedtls)
@@ -229,12 +277,11 @@ if(CONFIG_ESPRESSIF_WIFI)
 
   # mbedTLS port (Wireless.mk lines 116–127)
   set(MBEDTLS_PORT_SRCS
-      ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/esp_psa_crypto_init.c
-      ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/esp_hardware.c
-      ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/esp_mem.c
-      ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/esp_timing.c
-      ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/psa_driver/esp_mac/psa_crypto_driver_esp_hmac_opaque.c
-      ${ESP_HAL_3RDPARTY_REPO}/components/mbedtls/port/psa_driver/esp_md/psa_crypto_driver_esp_md5.c
+      ${ESP_MBEDTLS_COMPONENT_REPO}/port/esp_psa_crypto_init.c
+      ${ESP_MBEDTLS_COMPONENT_REPO}/port/esp_hardware.c
+      ${ESP_MBEDTLS_COMPONENT_REPO}/port/esp_mem.c
+      ${ESP_MBEDTLS_COMPONENT_REPO}/port/esp_timing.c
+      ${ESP_MBEDTLS_COMPONENT_REPO}/port/psa_driver/esp_md/psa_crypto_driver_esp_md5.c
   )
 
   target_sources(arch PRIVATE ${MBEDTLS_SRCS} ${TF_PSA_CORE_SRCS}
@@ -244,7 +291,9 @@ if(CONFIG_ESPRESSIF_WIFI)
   # WPA Supplicant
   # ############################################################################
 
-  set(WPA_SUPPLICANT_DIR ${ESP_HAL_3RDPARTY_REPO}/components/wpa_supplicant)
+  # WPA's OS port and chip components come from the same frozen HAL tree.
+  set(WPA_SUPPLICANT_DIR
+      ${ESP_HAL_3RDPARTY_REPO}/components/wpa_supplicant)
 
   target_compile_definitions(
     arch
@@ -385,6 +434,7 @@ if(CONFIG_ESPRESSIF_WIFI)
       ${WPA_SUPPLICANT_DIR}/esp_supplicant/src/esp_owe.c
       ${WPA_SUPPLICANT_DIR}/esp_supplicant/src/esp_scan.c
       ${WPA_SUPPLICANT_DIR}/esp_supplicant/src/esp_wps.c
+      ${WPA_SUPPLICANT_DIR}/esp_supplicant/src/esp_eap_client.c
       ${WPA_SUPPLICANT_DIR}/esp_supplicant/src/crypto/crypto_mbedtls-bignum.c
       ${WPA_SUPPLICANT_DIR}/esp_supplicant/src/crypto/crypto_mbedtls-ec.c
       ${WPA_SUPPLICANT_DIR}/esp_supplicant/src/crypto/crypto_mbedtls-rsa.c
@@ -399,6 +449,25 @@ if(CONFIG_ESPRESSIF_WIFI)
       ${ESP_HAL_3RDPARTY_REPO}/components/esp_wifi/regulatory/esp_wifi_regulatory.c
   )
 
+  # The component-only S31 snapshot has no NuttX port for the PHY lifecycle.
+  # Use the fixed NuttX-adapted common sources with the S31-specific init data.
+  # phy_override.c supplies the strong definitions of the hooks that libphy
+  # otherwise resolves to its own weak stubs: die-temperature readback for RF
+  # temperature compensation, temperature-sensor and power-detector power
+  # control, and the analog I2C critical section.  It pulls in the shared SAR
+  # power control the temperature sensor is built on.
+  set(ESP_PHY_SRCS
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/src/lib_printf.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/src/phy_common.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/src/phy_init.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/src/phy_override.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_hw_support/sar_periph_ctrl_common.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_hw_support/sar_tsens_ctrl.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_hw_support/port/${CHIP_SERIES}/sar_periph_ctrl.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_hal_ana_conv/temperature_sensor_hal.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_hal_ana_conv/${CHIP_SERIES}/temperature_sensor_periph.c
+      ${ESP_HAL_3RDPARTY_REPO}/components/esp_phy/${CHIP_SERIES}/phy_init_data.c)
+
   # Add all WPA supplicant sources
   target_sources(
     arch
@@ -410,6 +479,7 @@ if(CONFIG_ESPRESSIF_WIFI)
             ${WPA_UTILS_SRCS}
             ${WPA_PORT_SRCS}
             ${ESP_SUPPLICANT_SRCS}
-            ${ESP_WIFI_SRCS})
+            ${ESP_WIFI_SRCS}
+            ${ESP_PHY_SRCS})
 
 endif() # CONFIG_ESPRESSIF_WIFI

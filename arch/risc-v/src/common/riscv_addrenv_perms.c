@@ -100,6 +100,8 @@ static int modify_region(uintptr_t vstart, uintptr_t vend, uintptr_t setmask)
   UP_ISB();
   UP_DMB();
 
+  riscv_tlb_shootdown_range(vstart, (size_t)(vend - vstart));
+
   return OK;
 }
 

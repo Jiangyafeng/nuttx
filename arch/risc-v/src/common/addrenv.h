@@ -50,11 +50,34 @@
 
 /* Maximum user address environment size */
 
-#define ARCH_ADDRENV_MAX_SIZE   (0x40000000)
+#define ARCH_ADDRENV_MAX_SIZE   ((uintptr_t)0x40000000u)
 
 /* User address environment end */
 
 #define ARCH_ADDRENV_VEND       (ARCH_ADDRENV_VBASE + ARCH_ADDRENV_MAX_SIZE - 1)
+
+/****************************************************************************
+ * Public Types
+ ****************************************************************************/
+
+/* Address environment lifecycle accounting.  Heap deltas cannot distinguish a
+ * leaked environment from allocator fragmentation, so the create/destroy edges
+ * and the page counts they move are recorded directly here.  "live" is the
+ * balance that must return to its idle value once every user process exits.
+ */
+
+struct riscv_addrenv_stats_s
+{
+  uint32_t created;      /* Successful up_addrenv_create() calls */
+  uint32_t create_fail;  /* Failed up_addrenv_create() calls */
+  uint32_t destroyed;    /* up_addrenv_destroy() calls */
+  uint32_t live;         /* created - destroyed */
+  uint32_t live_max;     /* Highest concurrent live count observed */
+  uint32_t pages_freed;  /* Backing pages returned by destroy */
+  uint32_t pgt_freed;    /* Page tables returned by destroy */
+};
+
+extern struct riscv_addrenv_stats_s g_riscv_addrenv_stats;
 
 /****************************************************************************
  * Public Function Prototypes

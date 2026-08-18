@@ -279,9 +279,14 @@ static inline uintptr_t mmu_read_satp(void)
 
 static inline void mmu_invalidate_tlb_by_vaddr(uintptr_t vaddr)
 {
+  /* rs1 carries the virtual address and rs2 the ASID.  Passing the address
+   * as rs2 would instead invalidate an unrelated ASID and leave the mapping
+   * for vaddr cached on this hart.
+   */
+
   __asm__ __volatile__
     (
-      "sfence.vma x0, %0\n"
+      "sfence.vma %0, x0\n"
       :
       : "rK" (vaddr)
       : "memory"
@@ -306,6 +311,31 @@ static inline void mmu_invalidate_tlbs(void)
       : "memory"
     );
 }
+
+/****************************************************************************
+ * Name: riscv_tlb_shootdown_range / riscv_tlb_shootdown_all
+ *
+ * Description:
+ *   Extend the local sfence.vma above to the other harts.  The mapping paths
+ *   call these after a page table edit is visible in memory; chips without
+ *   CONFIG_ARCH_RV_TLB_SHOOTDOWN compile them away.
+ *
+ *   riscv_tlb_shootdown_range() covers [vaddr, vaddr + size); a zero size
+ *   degenerates to a full flush.  Both also invalidate the calling hart, so
+ *   callers need no separate local sfence.
+ *
+ * Returned Value:
+ *   Zero on success; a negated errno if a remote hart failed to acknowledge.
+ *
+ ****************************************************************************/
+
+#ifdef CONFIG_ARCH_RV_TLB_SHOOTDOWN
+int riscv_tlb_shootdown_range(uintptr_t vaddr, size_t size);
+int riscv_tlb_shootdown_all(void);
+#else
+#  define riscv_tlb_shootdown_range(vaddr, size) (0)
+#  define riscv_tlb_shootdown_all()              (0)
+#endif
 
 /****************************************************************************
  * Name: mmu_enable

@@ -155,11 +155,15 @@ endif
 
 ifeq ($(CONFIG_RISCV_TOOLCHAIN),GNU_RVG)
 
+  ifeq ($(CONFIG_ARCH_CHIP_ESP32S31),y)
+    CROSSDEV ?= riscv32-esp-elf-
+  endif
+
   # Generic GNU RVG toolchain, prefer to use riscv-none-elf-gcc from xPack
   # if CROSSDEV is not defined.
 
   ifeq ($(CONFIG_ARCH_TOOLCHAIN_CLANG),y)
-    CROSSDEV ?= riscv64-unknown-elf-
+      CROSSDEV ?= riscv64-unknown-elf-
   else
     ifeq ($(shell riscv-none-elf-gcc --version > /dev/null 2>&1; echo $$?), 0)
       CROSSDEV ?= riscv-none-elf-

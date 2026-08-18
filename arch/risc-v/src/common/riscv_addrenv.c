@@ -74,6 +74,10 @@
 #include "pgalloc.h"
 #include "riscv_mmu.h"
 
+#if defined(CONFIG_ARCH_CHIP_ESP32S31)
+#  include "esp32s31_mm_init.h"
+#endif
+
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -98,6 +102,8 @@ static_assert((ARCH_ADDRENV_VBASE & RV_MMU_SECTION_ALIGN) == 0,
  ****************************************************************************/
 
 extern uintptr_t            g_kernel_mappings;
+
+struct riscv_addrenv_stats_s g_riscv_addrenv_stats;
 
 /****************************************************************************
  * Private Functions
@@ -162,7 +168,7 @@ static int create_spgtables(arch_addrenv_t *addrenv)
 
   for (i = 0; i < ARCH_SPGTS; i++)
     {
-      paddr = mm_pgalloc(1);
+      paddr = riscv_pgtable_alloc();
       if (!paddr)
         {
           return -ENOMEM;
@@ -265,7 +271,7 @@ static int create_region(arch_addrenv_t *addrenv, uintptr_t vaddr,
         {
           /* Nothing yet, allocate one page for final level page table */
 
-          paddr = mm_pgalloc(1);
+          paddr = riscv_pgtable_alloc();
           if (!paddr)
             {
               return -ENOMEM;
@@ -389,6 +395,18 @@ int up_addrenv_create(size_t textsize, size_t datasize, size_t heapsize,
 
   memset(addrenv, 0, sizeof(arch_addrenv_t));
 
+  /* Count the environment as owned from here on.  Every failure below leaves
+   * through errout, which calls up_addrenv_destroy() exactly once, so the
+   * create/destroy balance stays exact even for partial allocations.
+   */
+
+  g_riscv_addrenv_stats.created++;
+  g_riscv_addrenv_stats.live++;
+  if (g_riscv_addrenv_stats.live > g_riscv_addrenv_stats.live_max)
+    {
+      g_riscv_addrenv_stats.live_max = g_riscv_addrenv_stats.live;
+    }
+
   /* Create the static page tables */
 
   ret = create_spgtables(addrenv);
@@ -492,6 +510,7 @@ int up_addrenv_create(size_t textsize, size_t datasize, size_t heapsize,
   return OK;
 
 errout:
+  g_riscv_addrenv_stats.create_fail++;
   up_addrenv_destroy(addrenv);
   return ret;
 }
@@ -519,12 +538,26 @@ int up_addrenv_destroy(arch_addrenv_t *addrenv)
   uintptr_t *ptprev;
   uintptr_t *ptlast;
   uintptr_t  paddr;
+  uintptr_t  ptpaddr;
   uintptr_t  vaddr;
   size_t     pgsize;
   int        i;
   int        j;
 
   DEBUGASSERT(addrenv);
+
+  g_riscv_addrenv_stats.destroyed++;
+  if (g_riscv_addrenv_stats.live > 0)
+    {
+      g_riscv_addrenv_stats.live--;
+    }
+
+  /* Flush remote TLBs before the page tables and backing pages disappear.
+   * Without this, another hart could still translate into memory that is
+   * about to be reused by a different address environment.
+   */
+
+  riscv_tlb_shootdown_all();
 
   /* Make sure the caches are flushed before doing this */
 
@@ -546,7 +579,8 @@ int up_addrenv_destroy(arch_addrenv_t *addrenv)
       i = (ARCH_SPGTS < 2) ? vaddr / pgsize : 0;
       for (; i < ENTRIES_PER_PGT; i++, vaddr += pgsize)
         {
-          ptlast = (uintptr_t *)riscv_pgvaddr(mmu_pte_to_paddr(ptprev[i]));
+          ptpaddr = mmu_pte_to_paddr(ptprev[i]);
+          ptlast = (uintptr_t *)riscv_pgvaddr(ptpaddr);
           if (ptlast)
             {
               if (!vaddr_is_shm(vaddr))
@@ -559,13 +593,15 @@ int up_addrenv_destroy(arch_addrenv_t *addrenv)
                       if (paddr)
                         {
                           mm_pgfree(paddr, 1);
+                          g_riscv_addrenv_stats.pages_freed++;
                         }
                     }
                 }
 
               /* Regardless, free the page table itself */
 
-              mm_pgfree((uintptr_t)ptlast, 1);
+              riscv_pgtable_free(ptpaddr);
+              g_riscv_addrenv_stats.pgt_freed++;
             }
         }
     }
@@ -577,7 +613,8 @@ int up_addrenv_destroy(arch_addrenv_t *addrenv)
       paddr = addrenv->spgtables[i];
       if (paddr)
         {
-          mm_pgfree(paddr, 1);
+          riscv_pgtable_free(paddr);
+          g_riscv_addrenv_stats.pgt_freed++;
         }
     }
 
@@ -726,6 +763,28 @@ int up_addrenv_select(const arch_addrenv_t *addrenv)
 }
 
 /****************************************************************************
+ * Name: up_addrenv_deselect
+ *
+ * Description:
+ *   Uninstall the address environment currently instantiated on this hart by
+ *   returning satp to the kernel page tables.  Kernel mappings are present
+ *   in both, so kernel execution continues across the switch; user mappings
+ *   are gone once it completes.
+ *
+ * Input Parameters:
+ *   None.
+ *
+ * Returned Value:
+ *   None.
+ *
+ ****************************************************************************/
+
+void up_addrenv_deselect(void)
+{
+  mmu_write_satp(mmu_satp_reg(g_kernel_pgt_pbase, 0));
+}
+
+/****************************************************************************
  * Name: up_addrenv_coherent
  *
  * Description:
@@ -743,7 +802,11 @@ int up_addrenv_select(const arch_addrenv_t *addrenv)
 
 int up_addrenv_coherent(const arch_addrenv_t *addrenv)
 {
-  /* Nothing needs to be done */
+#if defined(CONFIG_ARCH_CHIP_ESP32S31)
+  esp32s31_addrenv_coherent();
+#else
+  /* Coherent platforms need no additional cache maintenance. */
+#endif
 
   return OK;
 }

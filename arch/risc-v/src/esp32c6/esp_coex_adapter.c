@@ -40,6 +40,7 @@
 #include "esp_wifi_utils.h"
 
 #include "esp_attr.h"
+#include "esp_err.h"
 #include "esp_timer.h"
 #include "soc/rtc.h"
 #include "esp_private/esp_clk.h"
@@ -47,6 +48,9 @@
 #include "rom/ets_sys.h"
 #include "soc/soc_caps.h"
 #include "private/esp_modem_wrapper.h"
+#if defined(CONFIG_ESP_COEX_GPIO_DEBUG) && CONFIG_ESP_COEX_GPIO_DEBUG
+#  include "private/esp_coexist_debug.h"
+#endif
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -64,6 +68,44 @@ static int32_t esp_coex_semphr_take_from_isr_wrapper(void *semphr,
 static int32_t esp_coex_semphr_give_from_isr_wrapper(void *semphr,
                                                      void *hptw);
 static int esp_coex_is_in_isr_wrapper(void);
+static int esp_coex_debug_matrix_init_wrapper(int event, int signal,
+                                               bool reverse);
+static int esp_coex_xtal_freq_get_wrapper(void);
+
+/****************************************************************************
+ * Private Functions
+ ****************************************************************************/
+
+/* A flat build exposes the kernel allocators as macros, which cannot be taken
+ * as function pointers, so the adapter table needs a real function.
+ */
+
+static void esp_coex_free_wrapper(void *ptr)
+{
+  kmm_free(ptr);
+}
+
+/* Keep the S31 coexistence adapter ABI field-for-field aligned with IDF.
+ * The older NuttX C6-derived table left both trailing callbacks NULL.
+ */
+
+static int esp_coex_debug_matrix_init_wrapper(int event, int signal,
+                                               bool reverse)
+{
+#if defined(CONFIG_ESP_COEX_GPIO_DEBUG) && CONFIG_ESP_COEX_GPIO_DEBUG
+  return esp_coexist_debug_matrix_init(event, signal, reverse);
+#else
+  UNUSED(event);
+  UNUSED(signal);
+  UNUSED(reverse);
+  return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static IRAM_ATTR int esp_coex_xtal_freq_get_wrapper(void)
+{
+  return (int)rtc_clk_xtal_freq_get();
+}
 
 /****************************************************************************
  * Public Data
@@ -81,13 +123,15 @@ coex_adapter_funcs_t g_coex_adapter_funcs =
   ._semphr_give = esp_coex_common_semphr_give_wrapper,
   ._is_in_isr = esp_coex_is_in_isr_wrapper,
   ._malloc_internal = esp_coex_common_malloc_internal_wrapper,
-  ._free = free,
+  ._free = esp_coex_free_wrapper,
   ._esp_timer_get_time = esp_coex_esp_timer_get_time_wrapper,
   ._env_is_chip = esp_coex_common_env_is_chip_wrapper,
   ._timer_disarm = esp_coex_common_timer_disarm_wrapper,
   ._timer_done = esp_coex_common_timer_done_wrapper,
   ._timer_setfn = esp_coex_common_timer_setfn_wrapper,
   ._timer_arm_us = esp_coex_common_timer_arm_us_wrapper,
+  ._debug_matrix_init = esp_coex_debug_matrix_init_wrapper,
+  ._xtal_freq_get = esp_coex_xtal_freq_get_wrapper,
   ._magic = COEX_ADAPTER_MAGIC,
 };
 
@@ -204,7 +248,12 @@ static int IRAM_ATTR esp_coex_is_in_isr_wrapper(void)
 
 bool IRAM_ATTR esp_coex_common_env_is_chip_wrapper(void)
 {
-#ifdef CONFIG_IDF_ENV_FPGA
+  /* NuttX's IDF compatibility sdkconfig.h defines disabled options to 0.
+   * Test the value rather than mere macro presence, otherwise real silicon
+   * is reported as FPGA and the Wi-Fi channel manager selects the wrong CBW.
+   */
+
+#if CONFIG_IDF_ENV_FPGA
   return false;
 #else
   return true;
@@ -398,13 +447,13 @@ int32_t esp_coex_common_semphr_take_wrapper(void *semphr,
 
   if (block_time_tick == OSI_FUNCS_TIME_BLOCKING)
     {
-      ret = nxsem_wait(sem);
+      ret = nxsem_wait_uninterruptible(sem);
     }
   else
     {
       if (block_time_tick > 0)
         {
-          ret = nxsem_tickwait(sem, block_time_tick);
+          ret = nxsem_tickwait_uninterruptible(sem, block_time_tick);
         }
       else
         {

@@ -180,28 +180,17 @@ const struct procfs_operations g_part_operations =
  *
  ****************************************************************************/
 
-static bool part_blockcheck(FAR struct mtd_partition_s *priv, off_t block)
+static bool part_rangecheck(off_t start, size_t count, uint64_t limit)
 {
-  off_t partsize;
+  uint64_t offset;
 
-  partsize = priv->geo.neraseblocks * priv->blkpererase;
-  return block < partsize;
-}
+  if (start < 0)
+    {
+      return false;
+    }
 
-/****************************************************************************
- * Name: part_bytecheck
- *
- * Description:
- *   Check if the provided byte offset lies within the partition
- *
- ****************************************************************************/
-
-static bool part_bytecheck(FAR struct mtd_partition_s *priv, off_t byoff)
-{
-  off_t readend;
-
-  readend   = (byoff + priv->geo.erasesize - 1) / priv->geo.erasesize;
-  return readend <= priv->geo.neraseblocks;
+  offset = (uint64_t)start;
+  return offset <= limit && (uint64_t)count <= limit - offset;
 }
 
 /****************************************************************************
@@ -226,7 +215,7 @@ static int part_erase(FAR struct mtd_dev_s *dev, off_t startblock,
 
   /* Make sure that erase would not extend past the end of the partition */
 
-  if (!part_blockcheck(priv, (startblock + nblocks - 1) * priv->blkpererase))
+  if (!part_rangecheck(startblock, nblocks, priv->geo.neraseblocks))
     {
       ferr("ERROR: Erase beyond the end of the partition\n");
       return -ENXIO;
@@ -261,7 +250,9 @@ static ssize_t part_bread(FAR struct mtd_dev_s *dev, off_t startblock,
 
   /* Make sure that read would not extend past the end of the partition */
 
-  if (!part_blockcheck(priv, startblock + nblocks - 1))
+  if (!part_rangecheck(startblock, nblocks,
+                       (uint64_t)priv->geo.neraseblocks *
+                       priv->blkpererase))
     {
       ferr("ERROR: Read beyond the end of the partition\n");
       return -ENXIO;
@@ -292,7 +283,9 @@ static ssize_t part_bwrite(FAR struct mtd_dev_s *dev, off_t startblock,
 
   /* Make sure that write would not extend past the end of the partition */
 
-  if (!part_blockcheck(priv, startblock + nblocks - 1))
+  if (!part_rangecheck(startblock, nblocks,
+                       (uint64_t)priv->geo.neraseblocks *
+                       priv->blkpererase))
     {
       ferr("ERROR: Write beyond the end of the partition\n");
       return -ENXIO;
@@ -328,7 +321,9 @@ static ssize_t part_read(FAR struct mtd_dev_s *dev, off_t offset,
     {
       /* Make sure that read would not extend past the end of the partition */
 
-      if (!part_bytecheck(priv, offset + nbytes - 1))
+      if (!part_rangecheck(offset, nbytes,
+                           (uint64_t)priv->geo.neraseblocks *
+                           priv->geo.erasesize))
         {
           ferr("ERROR: Read beyond the end of the partition\n");
           return -ENXIO;
@@ -368,7 +363,9 @@ static ssize_t part_write(FAR struct mtd_dev_s *dev, off_t offset,
        * partition
        */
 
-      if (!part_bytecheck(priv, offset + nbytes - 1))
+      if (!part_rangecheck(offset, nbytes,
+                           (uint64_t)priv->geo.neraseblocks *
+                           priv->geo.erasesize))
         {
           ferr("ERROR: Write beyond the end of the partition\n");
           return -ENXIO;

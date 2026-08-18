@@ -77,6 +77,9 @@
  * Private Data
  ****************************************************************************/
 
+static mutex_t g_spiflash_init_lock = NXMUTEX_INITIALIZER;
+static bool g_spiflash_initialized;
+
 #if CONFIG_ESPRESSIF_SECURE_FLASH_ENC_ENABLED
 static uint8_t write_aux_buf[FLASH_SECTOR_SIZE] =
 {
@@ -462,6 +465,54 @@ static bool aligned_flash_erase(size_t addr, size_t size)
  ****************************************************************************/
 
 /****************************************************************************
+ * Name: esp_spiflash_init
+ ****************************************************************************/
+
+int esp_spiflash_init(void)
+{
+  esp_err_t err;
+  int ret;
+
+  if (g_spiflash_initialized)
+    {
+      return OK;
+    }
+
+  ret = nxmutex_lock(&g_spiflash_init_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (!g_spiflash_initialized)
+    {
+      err = esp_flash_app_init();
+      if (err != ESP_OK)
+        {
+          ferr("ERROR: esp_flash_app_init failed: %d\n", err);
+          ret = -EIO;
+          goto out;
+        }
+
+      err = esp_flash_init_default_chip();
+      if (err != ESP_OK)
+        {
+          ferr("ERROR: esp_flash_init_default_chip failed: %d\n", err);
+          ret = -EIO;
+          goto out;
+        }
+
+      g_spiflash_initialized = true;
+    }
+
+  ret = OK;
+
+out:
+  nxmutex_unlock(&g_spiflash_init_lock);
+  return ret;
+}
+
+/****************************************************************************
  * Name: esp_spiflash_read
  *
  * Description:
@@ -480,7 +531,13 @@ static bool aligned_flash_erase(size_t addr, size_t size)
 int esp_spiflash_read(uint32_t address, void *buffer,
                       uint32_t length)
 {
-  int ret = OK;
+  int ret;
+
+  ret = esp_spiflash_init();
+  if (ret < 0)
+    {
+      return ret;
+    }
 
   ret = flash_esp32_read_check_enc(address, buffer, length);
   if (ret != 0)
@@ -511,10 +568,16 @@ int esp_spiflash_read(uint32_t address, void *buffer,
 int esp_spiflash_write(uint32_t address, const void *buffer,
                        uint32_t length)
 {
-  int ret = OK;
+  int ret;
 #if CONFIG_ESPRESSIF_SECURE_FLASH_ENC_ENABLED
   bool erase = false;
 #endif
+
+  ret = esp_spiflash_init();
+  if (ret < 0)
+    {
+      return ret;
+    }
 
 #if CONFIG_ESPRESSIF_SECURE_FLASH_ENC_ENABLED
   if (esp_flash_encryption_enabled())
@@ -561,7 +624,13 @@ int esp_spiflash_write(uint32_t address, const void *buffer,
 
 int esp_spiflash_erase(uint32_t address, uint32_t length)
 {
-  int ret = OK;
+  int ret;
+
+  ret = esp_spiflash_init();
+  if (ret < 0)
+    {
+      return ret;
+    }
 
 #if CONFIG_ESPRESSIF_SECURE_FLASH_ENC_ENABLED
   if (!aligned_flash_erase(address, length))

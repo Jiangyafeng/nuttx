@@ -49,11 +49,11 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#if SOC_SYSTIMER_INT_LEVEL
+#if SYSTIMER_LL_INT_LEVEL
 #  define SYSTIMER_TRIGGER_TYPE ESP_IRQ_TRIGGER_LEVEL
 #else
 #  define SYSTIMER_TRIGGER_TYPE ESP_IRQ_TRIGGER_EDGE
-#endif /* SOC_SYSTIMER_INT_LEVEL */
+#endif /* SYSTIMER_LL_INT_LEVEL */
 
 /****************************************************************************
  * Private Data

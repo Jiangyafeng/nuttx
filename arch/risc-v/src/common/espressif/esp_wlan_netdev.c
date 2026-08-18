@@ -33,7 +33,11 @@
 #include <nuttx/wireless/wireless.h>
 #include <nuttx/net/netdev_lowerhalf.h>
 
+#include <nuttx/clock.h>
+#include <nuttx/wqueue.h>
+
 #include "esp_attr.h"
+#include "esp_private/wifi.h"
 
 #include "esp_wifi_api.h"
 #include "esp_wifi_utils.h"
@@ -52,6 +56,8 @@
  #define TX_BUF_COUNT 1
 
  #define CONNECT_TIMEOUT CONFIG_ESPRESSIF_WIFI_CONNECT_TIMEOUT
+
+ #define STA_IP_POLL_MS 250
 
 /****************************************************************************
  * Private Types
@@ -94,6 +100,10 @@ static int esp_wlan_range(struct netdev_lowerhalf_s *dev, struct iwreq *iwr);
 /****************************************************************************
  * Private Data
  ****************************************************************************/
+
+#ifdef ESP_WLAN_HAS_STA
+static struct work_s g_sta_ip_work;
+#endif
 
 /* Common Wi-Fi controller data */
 
@@ -174,6 +184,7 @@ static struct esp_wlan_priv_s g_wlan_sta =
   .common = &g_common_wifi,
   .mode = IW_MODE_INFRA,
 };
+
 #endif  /* ESP_WLAN_HAS_STA */
 
 /* SoftAP interface control structure */
@@ -433,10 +444,15 @@ static int esp_wlan_connect(struct netdev_lowerhalf_s *dev)
   useconds_t timeout = 1000 * 1000;  /* 1 second */
   int timeout_count = CONNECT_TIMEOUT;
   volatile bool connection_success = false;
-  volatile bool timeout_reached = false;
 
   if (priv->mode == IW_MODE_INFRA)
     {
+      /* A delayed disconnect event from a preceding credential/SSID update
+       * must not leave a stale IFF_RUNNING bit that makes this synchronous
+       * operation report success before the new association completes.
+       */
+
+      netdev_lower_carrier_off(&priv->dev);
       ret = esp_wifi_sta_connect();
       if (ret < 0)
         {
@@ -1015,6 +1031,38 @@ void IRAM_ATTR esp_wifi_tx_done_cb(uint8_t ifidx,
  *
  ****************************************************************************/
 
+#ifdef ESP_WLAN_HAS_STA
+
+/****************************************************************************
+ * Name: wlan_sta_ip_poll
+ *
+ * Description:
+ *   Tell the Wi-Fi blob that the station owns an IPv4 address.  ESP-IDF does
+ *   this from its esp-netif GOT_IP handler; NuttX has no equivalent event, so
+ *   the address is polled until DHCP or a static configuration supplies one.
+ *
+ ****************************************************************************/
+
+static void wlan_sta_ip_poll(void *arg)
+{
+  if (g_wlan_sta.dev.netdev.d_ipaddr != 0)
+    {
+      int ret;
+
+      ret = esp_wifi_internal_set_sta_ip();
+      if (ret == 0)
+        {
+          return;
+        }
+
+      wlerr("ERROR: Failed to publish station IP: %d\n", ret);
+    }
+
+  work_queue(LPWORK, &g_sta_ip_work, wlan_sta_ip_poll, NULL,
+             MSEC2TICK(STA_IP_POLL_MS));
+}
+#endif
+
 static int wlan_rx_done(struct esp_wlan_priv_s *priv,
                         void *buffer, uint16_t len, void *eb)
 {
@@ -1303,7 +1351,25 @@ static int esp_wlan_initialize(uint32_t mode)
 void esp_wlan_sta_connect_success_hook(void)
 {
   struct esp_wlan_priv_s *priv = &g_wlan_sta;
+  int ret;
+
+  /* The vendor driver accepts registration before esp_wifi_start(), but its
+   * station receive path becomes ready only after association and may clear
+   * the earlier callback while transitioning states.  This matches the IDF
+   * esp-netif lifecycle, which registers the STA RX callback on connect.
+   */
+
+  ret = esp_wifi_api_sta_register_rx_callback(wlan_sta_rx_done);
+  if (ret < 0)
+    {
+      wlerr("ERROR: Failed to register station RX callback: %d\n", ret);
+      return;
+    }
+
   netdev_lower_carrier_on(&priv->dev);
+
+  work_queue(LPWORK, &g_sta_ip_work, wlan_sta_ip_poll, NULL,
+             MSEC2TICK(STA_IP_POLL_MS));
 }
 #endif
 
@@ -1325,6 +1391,8 @@ void esp_wlan_sta_connect_success_hook(void)
 void esp_wlan_sta_disconnect_hook(void)
 {
   struct esp_wlan_priv_s *priv = &g_wlan_sta;
+
+  work_cancel(LPWORK, &g_sta_ip_work);
   netdev_lower_carrier_off(&priv->dev);
 }
 #endif
@@ -1347,6 +1415,15 @@ void esp_wlan_sta_disconnect_hook(void)
 void esp_wlan_softap_connect_success_hook(void)
 {
   struct esp_wlan_priv_s *priv = &g_wlan_softap;
+  int ret;
+
+  ret = esp_wifi_api_softap_register_rx_callback(wlan_softap_rx_done);
+  if (ret < 0)
+    {
+      wlerr("ERROR: Failed to register SoftAP RX callback: %d\n", ret);
+      return;
+    }
+
   netdev_lower_carrier_on(&priv->dev);
 }
 #endif

@@ -39,58 +39,6 @@
 
 #if CONFIG_RR_INTERVAL > 0
 
-#ifdef CONFIG_SMP
-
-/****************************************************************************
- * Private Data
- ****************************************************************************/
-
-#ifdef CONFIG_SMP
-static struct smp_call_data_s g_call_data;
-#endif
-
-/****************************************************************************
- * Private Types
- ****************************************************************************/
-
-struct roundrobin_arg_s
-{
-  pid_t pid;
-};
-
-/****************************************************************************
- * Private Functions
- ****************************************************************************/
-
-static int nxsched_roundrobin_handler(FAR void *cookie)
-{
-  pid_t pid = (uintptr_t)cookie;
-  FAR struct tcb_s *tcb;
-  irqstate_t flags;
-
-  flags = enter_critical_section();
-  tcb = nxsched_get_tcb(pid);
-
-  if (!tcb || tcb->task_state == TSTATE_TASK_INVALID ||
-      (tcb->flags & TCB_FLAG_EXIT_PROCESSING) != 0)
-    {
-      /* There is no TCB with this pid or, if there is, it is not a task. */
-
-      leave_critical_section(flags);
-      return OK;
-    }
-
-  if (tcb->task_state == TSTATE_TASK_RUNNING && tcb->cpu == this_cpu() &&
-      nxsched_switch_running(tcb->cpu, true))
-    {
-      up_switch_context(this_task(), tcb);
-    }
-
-  leave_critical_section(flags);
-  return OK;
-}
-#endif
-
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -186,19 +134,20 @@ clock_t nxsched_process_roundrobin(FAR struct tcb_s *tcb, clock_t ticks,
           /* In SMP mode, the running task is in g_assignedtasks[cpu], not
            * in the ready-to-run list.  Therefore, tcb->flink is NULL and
            * we cannot check it to find the next task.  If the task is
-           * running on a different CPU, send an SMP call to that CPU.
+           * running on a different CPU, use the scheduler's dedicated task
+           * delivery state to ask that CPU for an equal-priority switch.
+           * This keeps the actual switch inside the target IPI's one
+           * save/restore window; a generic SMP-call callback may change the
+           * current task before that window has captured its interrupted
+           * context.
            * Otherwise, directly call nxsched_switch_running() to find the
-           * directly call nxsched_switch_running() to find the next eligible
-           * task from the ready-to-run list and switch to it.
+           * next eligible task from the ready-to-run list and switch to it.
            */
 
           DEBUGASSERT(tcb->task_state == TSTATE_TASK_RUNNING);
           if (tcb->cpu != this_cpu())
             {
-              nxsched_smp_call_init(&g_call_data,
-                                    nxsched_roundrobin_handler,
-                                    (FAR void *)(uintptr_t)tcb->pid);
-              nxsched_smp_call_single_async(tcb->cpu, &g_call_data);
+              nxsched_deliver_task(this_cpu(), tcb->cpu, SWITCH_EQUAL);
             }
           else if (nxsched_switch_running(tcb->cpu, true))
             {

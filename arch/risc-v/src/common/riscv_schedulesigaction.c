@@ -121,4 +121,17 @@ void up_schedule_sigaction(struct tcb_s *tcb)
 #endif
 
   tcb->xcp.regs[REG_INT_CTX] = int_ctx;
+
+#if defined(CONFIG_ARCH_CHIP_ESP32S31) && \
+    defined(CONFIG_ARCH_RISCV_INTXCPT_EXTENSIONS)
+  /* ESP32-S31's CLIC xret consumes the previous privilege and interrupt
+   * enable state from the integer-extension cause slot as well as from
+   * sstatus.  The duplicated frame still describes the interrupted U-mode
+   * task, so synchronize it with the privileged, interrupt-disabled signal
+   * trampoline return prepared above.
+   */
+
+  tcb->xcp.regs[REG_INT_CTX + 1] &= ~UINT32_C(0x08000000);
+  tcb->xcp.regs[REG_INT_CTX + 1] |= UINT32_C(0x10000000);
+#endif
 }

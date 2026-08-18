@@ -1,0 +1,19 @@
+#############################################################################
+# boards/risc-v/esp32s31/esp32s31-core-function-board/src/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+#############################################################################
+
+include $(TOPDIR)/Make.defs
+
+CSRCS = esp32s31_boot.c esp32s31_bringup.c
+
+ifeq ($(CONFIG_BUILD_KERNEL),y)
+ifneq ($(CONFIG_ESP32S31_FLASH_APPFS),y)
+CSRCS += $(if $(wildcard romfs_boot.c),romfs_boot.c,romfs_stub.c)
+endif
+endif
+
+DEPPATH += --dep-path board
+VPATH += :board
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)board$(DELIM)board
