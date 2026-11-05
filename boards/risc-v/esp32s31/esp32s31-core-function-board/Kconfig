@@ -48,6 +48,7 @@ config ESP32S31_FLASH_APPFS_SEED_SIZE
 
 config ESP32S31_FLASH_APPFS_SEED_INSTALL
 	bool "Install sv32test into writable AppFS on first boot"
+	depends on EXAMPLES_SV32TEST
 	default y
 	---help---
 		Atomically copy sv32test and its SHA-256 manifest from /system/bin to

@@ -666,6 +666,10 @@ int esp_bringup(void)
   ret = esp32s31_install_seed_app();
   if (ret < 0)
     {
+#ifdef CONFIG_ESPRESSIF_WIFI
+      syslog(LOG_ERR, "ERROR: Wi-Fi initialization skipped after AppFS "
+             "seed install failure\n");
+#endif
       return ret;
     }
 #endif
