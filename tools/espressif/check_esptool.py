@@ -21,61 +21,56 @@
 ############################################################################
 import argparse
 import re
+import shutil
 import subprocess
 import sys
 
-parser = argparse.ArgumentParser(
-    prog="check_esptool",
-    description="Checks esptool version and returns true or \
-    false if it matches target version",
-)
-parser.add_argument("-v", "--version", action="store", required=True)
 
-
-def parse_version(version_string) -> list:
-    """Regex patteren to extract version major and minor."""
-    pattern = r"(\d+)\.(\d+)"
-    match = re.search(pattern, version_string)
+def parse_version(version_string) -> tuple:
+    """Extract a major/minor/patch version, accepting omitted patch zero."""
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version_string)
 
     if match:
-        major = int(match.group(1))
-        minor = int(match.group(2))
-        return [major, minor]
-    else:
-        return []
+        return tuple(int(part or 0) for part in match.groups())
+    return ()
 
 
-def check_version(min_esptool_version: str) -> bool:
-    """Attempts to read 'esptool' version using subprocess command
-    which improves compatibility with esptool installed by pipx like tools.
-    Compare current version with 'min_esptool_version' and returns.
+def check_version(min_esptool_version: str, esptool: str = None) -> bool:
+    """Check the selected esptool executable without importing its package.
 
-    Returns:
-        True: packages does not exist or outdated
-        False: package installed and up-to-date
+    Return True if the executable is missing, fails, or is too old.
+    CMake passes the exact executable used for image generation/flashing;
+    Make callers retain PATH discovery, including the legacy .py name.
     """
+    esptool = esptool or shutil.which("esptool") or shutil.which("esptool.py")
+    if not esptool:
+        print("esptool not found. Please run: 'pip install esptool'")
+        return True
+
     try:
-        # Run esptool.py version command
         result = subprocess.run(
-            ["esptool.py", "version"], capture_output=True, text=True, check=True
+            [esptool, "version"], capture_output=True, text=True, check=True
         )
         version_str = result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("esptool.py not found. Please run: 'pip install esptool'")
-        print("Run make again to create the nuttx.bin image.")
+    except (subprocess.CalledProcessError, OSError) as error:
+        print(f"Cannot check {esptool}: {error}")
         return True
 
     esptool_version = parse_version(version_str)
-    min_esptool_version = parse_version(parser.version)
+    minimum = parse_version(min_esptool_version)
 
-    if esptool_version >= min_esptool_version:
+    if esptool_version and minimum and esptool_version >= minimum:
         return False
 
-    print("Unsupported esptool version:", version_str, "expects >=", parser.version)
+    print("Unsupported esptool version:", version_str,
+          "expects >=", min_esptool_version)
     print("Upgrade using: 'pip install --upgrade esptool' and run 'make' again")
     return True
 
 
 if __name__ == "__main__":
-    parser = parser.parse_args()
-    sys.exit(check_version(parser.version))
+    parser = argparse.ArgumentParser(description="Check the esptool version")
+    parser.add_argument("-v", "--version", required=True)
+    parser.add_argument("--esptool", help="exact esptool executable to check")
+    args = parser.parse_args()
+    sys.exit(check_version(args.version, args.esptool))

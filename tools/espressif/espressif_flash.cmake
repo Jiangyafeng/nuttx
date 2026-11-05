@@ -115,13 +115,13 @@ endif()
 set(ESPTOOL_MIN_VERSION 4.8.0)
 if(EXISTS "${SOURCE_DIR}/tools/espressif/check_esptool.py")
   execute_process(
-    COMMAND ${PYTHON3} ${SOURCE_DIR}/tools/espressif/check_esptool.py -v
-            ${ESPTOOL_MIN_VERSION}
+    COMMAND "${PYTHON3}" "${SOURCE_DIR}/tools/espressif/check_esptool.py" -v
+            ${ESPTOOL_MIN_VERSION} --esptool "${ESPTOOL}"
     RESULT_VARIABLE ESPTOOL_CHECK_RESULT
     OUTPUT_QUIET ERROR_QUIET)
   if(NOT ESPTOOL_CHECK_RESULT EQUAL 0)
     message(
-      WARNING "esptool.py version ${ESPTOOL_MIN_VERSION} or higher recommended")
+      WARNING "${ESPTOOL} version ${ESPTOOL_MIN_VERSION} or higher recommended")
   endif()
 endif()
 

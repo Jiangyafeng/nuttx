@@ -216,7 +216,7 @@ endef
 # MERGEBIN -- Merge raw binary files into a single file
 
 define MERGEBIN
-	@python3 tools/espressif/check_esptool.py -v $(ESPTOOL_MIN_VERSION)
+	@python3 tools/espressif/check_esptool.py -v $(ESPTOOL_MIN_VERSION) --esptool esptool.py
 	$(Q) if [ -z $(ESPTOOL_BINDIR) ]; then \
 		echo "MERGEBIN error: Missing argument for binary files directory."; \
 		echo "USAGE: make ESPTOOL_BINDIR=<dir>"; \
@@ -250,7 +250,7 @@ endef
 else
 define MKIMAGE
 	$(Q) echo "MKIMAGE: NuttX binary"
-	@python3 tools/espressif/check_esptool.py -v $(ESPTOOL_MIN_VERSION)
+	@python3 tools/espressif/check_esptool.py -v $(ESPTOOL_MIN_VERSION) --esptool esptool.py
 	$(Q) if [ -z $(FLASH_SIZE) ]; then \
 		echo "Missing Flash memory size configuration."; \
 		exit 1; \

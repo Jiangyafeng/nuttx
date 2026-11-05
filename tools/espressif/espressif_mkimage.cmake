@@ -94,11 +94,12 @@ if(ESPTOOL
    AND PYTHON3
    AND EXISTS "${SOURCE_DIR}/tools/espressif/check_esptool.py")
   execute_process(
-    COMMAND ${PYTHON3} ${SOURCE_DIR}/tools/espressif/check_esptool.py -v 4.8.0
+    COMMAND "${PYTHON3}" "${SOURCE_DIR}/tools/espressif/check_esptool.py" -v
+            4.8.0 --esptool "${ESPTOOL}"
     RESULT_VARIABLE ESPTOOL_CHECK_RESULT
     OUTPUT_QUIET ERROR_QUIET)
   if(NOT ESPTOOL_CHECK_RESULT EQUAL 0)
-    message(WARNING "esptool.py version 4.8.0 or higher recommended")
+    message(WARNING "${ESPTOOL} version 4.8.0 or higher recommended")
   endif()
 endif()
 
