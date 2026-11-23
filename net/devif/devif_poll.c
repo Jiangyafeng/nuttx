@@ -1272,6 +1272,10 @@ int devif_poll_out(FAR struct net_driver_s *dev,
     }
 
   devif_out(dev);
+  if (dev->d_len == 0)
+    {
+      return 0;
+    }
 
   bstop = devif_loopback(dev);
   if (bstop)

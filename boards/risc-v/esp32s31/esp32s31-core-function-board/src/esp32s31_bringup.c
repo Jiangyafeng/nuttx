@@ -498,9 +498,33 @@ errout:
 #endif
 
 #ifdef CONFIG_ESPRESSIF_WIFI
-static int start_wifi_station(void)
+static int start_wifi(void)
 {
-  return esp_wlan_sta_initialize();
+  int ret = OK;
+
+#ifdef ESP_WLAN_HAS_STA
+  ret = esp_wlan_sta_initialize();
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: Wi-Fi station init failed: %d\n", ret);
+      return ret;
+    }
+
+  syslog(LOG_INFO, "E1 Wi-Fi station netdev ready\n");
+#endif
+
+#ifdef ESP_WLAN_HAS_SOFTAP
+  ret = esp_wlan_softap_initialize();
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: Wi-Fi SoftAP init failed: %d\n", ret);
+      return ret;
+    }
+
+  syslog(LOG_INFO, "E1 Wi-Fi SoftAP netdev ready\n");
+#endif
+
+  return ret;
 }
 #endif
 
@@ -675,15 +699,7 @@ int esp_bringup(void)
 #endif
 
 #ifdef CONFIG_ESPRESSIF_WIFI
-  ret = start_wifi_station();
-  if (ret < 0)
-    {
-      syslog(LOG_ERR, "ERROR: Wi-Fi station init failed: %d\n", ret);
-    }
-  else
-    {
-      syslog(LOG_INFO, "E1 Wi-Fi station netdev ready\n");
-    }
+  ret = start_wifi();
 #endif
 
   return ret;
@@ -706,7 +722,7 @@ int esp_bringup(void)
 #endif
 
 #ifdef CONFIG_ESPRESSIF_WIFI
-  return start_wifi_station();
+  return start_wifi();
 #endif
 
   return 0;

@@ -250,7 +250,8 @@ static int esp_wlan_ifup(struct netdev_lowerhalf_s *dev)
   ret = esp_wifi_api_start(priv->mode);
   if (ret)
     {
-      wlerr("ERROR: Failed to start Wi-Fi station\n");
+      wlerr("ERROR: Failed to start Wi-Fi %s\n",
+            priv->mode == IW_MODE_MASTER ? "SoftAP" : "station");
       return ret;
     }
 
@@ -285,10 +286,20 @@ static int esp_wlan_ifdown(struct netdev_lowerhalf_s *dev)
   struct esp_wlan_priv_s *priv = (struct esp_wlan_priv_s *)dev;
   int ret = OK;
 
+#ifdef ESP_WLAN_HAS_STA
+  if (priv->mode == IW_MODE_INFRA)
+    {
+      work_cancel(LPWORK, &g_sta_ip_work);
+    }
+#endif
+
+  netdev_lower_carrier_off(&priv->dev);
+
   ret = esp_wifi_api_stop(priv->mode);
   if (ret)
     {
-      wlerr("ERROR: Failed to stop Wi-Fi station\n");
+      wlerr("ERROR: Failed to stop Wi-Fi %s\n",
+            priv->mode == IW_MODE_MASTER ? "SoftAP" : "station");
     }
 
   return ret;
@@ -491,7 +502,13 @@ static int esp_wlan_connect(struct netdev_lowerhalf_s *dev)
 #ifdef ESP_WLAN_HAS_SOFTAP
   if (priv->mode == IW_MODE_MASTER)
     {
-      return esp_wifi_softap_connect();
+      int ap_ret = esp_wifi_softap_connect();
+      if (ap_ret == OK)
+        {
+          esp_wlan_softap_connect_success_hook();
+        }
+
+      return ap_ret;
     }
 #endif
 
@@ -936,13 +953,18 @@ static int esp_wlan_scan(struct netdev_lowerhalf_s *dev,
                          struct iwreq *iwr, bool set)
 {
 #ifdef ESP_WLAN_HAS_STA
-  if (set)
+  struct esp_wlan_priv_s *priv = (struct esp_wlan_priv_s *)dev;
+
+  if (priv->mode == IW_MODE_INFRA)
     {
-      return esp_wifi_start_scan(iwr);
-    }
-  else
-    {
-      return esp_wifi_get_scan_results(iwr);
+      if (set)
+        {
+          return esp_wifi_start_scan(iwr);
+        }
+      else
+        {
+          return esp_wifi_get_scan_results(iwr);
+        }
     }
 #endif
 
@@ -967,7 +989,21 @@ static int esp_wlan_scan(struct netdev_lowerhalf_s *dev,
 static int esp_wlan_range(struct netdev_lowerhalf_s *dev,
                           struct iwreq *iwr)
 {
-  /* TODO: Implement range get */
+  struct esp_wlan_priv_s *priv = (struct esp_wlan_priv_s *)dev;
+
+#ifdef ESP_WLAN_HAS_STA
+  if (priv->mode == IW_MODE_INFRA)
+    {
+      return esp_wifi_sta_channel(iwr, false);
+    }
+#endif
+
+#ifdef ESP_WLAN_HAS_SOFTAP
+  if (priv->mode == IW_MODE_MASTER)
+    {
+      return esp_wifi_softap_channel(iwr, false);
+    }
+#endif
 
   return -ENOSYS;
 }
@@ -1249,7 +1285,7 @@ static int esp_wlan_initialize(uint32_t mode)
         ret = esp_wifi_sta_read_mac(mac);
 #endif
         break;
-        case IW_MODE_MASTER:
+      case IW_MODE_MASTER:
 #ifdef ESP_WLAN_HAS_SOFTAP
         wlinfo("INFO: Initialize Wi-Fi SoftAP\n");
         priv = &g_wlan_softap;

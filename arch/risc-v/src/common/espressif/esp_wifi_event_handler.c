@@ -75,13 +75,16 @@ struct wifi_notify
  ****************************************************************************/
 
 static struct wifi_notify g_wifi_notify[WIFI_EVENT_MAX];
+#ifdef ESP_WLAN_HAS_STA
 static struct work_s g_wifi_reconnect_work;
+#endif
 static bool g_wifi_handler_registered;
 
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
 
+#ifdef ESP_WLAN_HAS_STA
 /****************************************************************************
  * Name: esp_reconnect_work_cb
  *
@@ -113,6 +116,7 @@ static void esp_reconnect_work_cb(void *arg)
       wlerr("Failed to reconnect to Wi-Fi on callback\n");
     }
 }
+#endif /* ESP_WLAN_HAS_STA */
 
 /****************************************************************************
  * Name: esp_wifi_event_handler
@@ -226,13 +230,20 @@ static void esp_wifi_event_handler(void *arg, esp_event_base_t event_base,
 #ifdef ESP_WLAN_HAS_SOFTAP
       case WIFI_EVENT_AP_START:
         {
+          wifi_mode_t cur_mode = WIFI_MODE_NULL;
+
           wlinfo("INFO: Wi-Fi softap start\n");
           esp_wlan_softap_connect_success_hook();
-          ret = esp_wifi_set_ps(ps_type);
-          if (ret)
+
+          if (esp_wifi_get_mode(&cur_mode) == ESP_OK &&
+              (cur_mode != WIFI_MODE_AP || ps_type == WIFI_PS_NONE))
             {
-              wlerr("Failed to set power save type\n");
-              break;
+              ret = esp_wifi_set_ps(ps_type);
+              if (ret)
+                {
+                  wlerr("Failed to set power save type\n");
+                  break;
+                }
             }
         }
         break;
@@ -245,11 +256,43 @@ static void esp_wifi_event_handler(void *arg, esp_event_base_t event_base,
         break;
 
       case WIFI_EVENT_AP_STACONNECTED:
-        wlinfo("Wi-Fi station joined AP\n");
+        {
+          wifi_event_ap_staconnected_t *event =
+              (wifi_event_ap_staconnected_t *)event_data;
+
+          if (event != NULL)
+            {
+              wlinfo("Wi-Fi station %02x:%02x:%02x:%02x:%02x:%02x joined AP "
+                     "(AID=%u)\n",
+                     event->mac[0], event->mac[1], event->mac[2],
+                     event->mac[3], event->mac[4], event->mac[5],
+                     event->aid);
+            }
+          else
+            {
+              wlinfo("Wi-Fi station joined AP\n");
+            }
+        }
         break;
 
       case WIFI_EVENT_AP_STADISCONNECTED:
-        wlinfo("Wi-Fi station left AP\n");
+        {
+          wifi_event_ap_stadisconnected_t *event =
+              (wifi_event_ap_stadisconnected_t *)event_data;
+
+          if (event != NULL)
+            {
+              wlinfo("Wi-Fi station %02x:%02x:%02x:%02x:%02x:%02x left AP "
+                     "(AID=%u, reason=%u)\n",
+                     event->mac[0], event->mac[1], event->mac[2],
+                     event->mac[3], event->mac[4], event->mac[5],
+                     event->aid, event->reason);
+            }
+          else
+            {
+              wlinfo("Wi-Fi station left AP\n");
+            }
+        }
         break;
 #endif /* ESP_WLAN_HAS_SOFTAP */
 

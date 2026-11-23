@@ -497,6 +497,13 @@ if(CONFIG_ESPRESSIF_SIMPLE_BOOT)
   target_link_options(nuttx PRIVATE -Wl,--wrap=bootloader_print_banner)
 endif()
 
+if(CONFIG_ESPRESSIF_WIFI)
+  list(APPEND HAL_SRCS
+       ${NUTTX_CHIP_ABS_DIR}/hal_backports/esp_wifi_wpa_ap_join_compat.c)
+  target_link_options(nuttx PRIVATE
+                      -Wl,--wrap=esp_wifi_register_wpa_cb_internal)
+endif()
+
 if(CONFIG_ESPRESSIF_SPIRAM)
   list(
     APPEND

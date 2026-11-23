@@ -29,6 +29,8 @@
 #include <errno.h>
 #include <nuttx/debug.h>
 #include <math.h>
+#include <netinet/arp.h>
+#include <sys/param.h>
 
 #include <psa/crypto.h>
 
@@ -80,6 +82,123 @@
 volatile bool g_sta_reconnect;
 
 #endif /* ESP_WLAN_HAS_STA */
+
+#ifdef ESP_WLAN_HAS_SOFTAP
+
+/* Track whether SoftAP has been configured (defaults or runtime WAPI), and
+ * defer auth settings when upgrading from OPEN before a password is supplied
+ * (wapi psk issues SIOCSIWAUTH before SIOCSIWENCODEEXT).
+ */
+
+static bool g_softap_configured;
+static bool g_softap_pending_auth;
+static wifi_auth_mode_t g_softap_pending_authmode;
+static wifi_pmf_config_t g_softap_pending_pmf;
+
+#endif /* ESP_WLAN_HAS_SOFTAP */
+
+/****************************************************************************
+ * Private Functions
+ ****************************************************************************/
+
+/****************************************************************************
+ * Name: esp_wifi_auth_trans
+ *
+ * Description:
+ *   Converts authenticate mode values to WEXT authenticate mode.
+ *
+ * Input Parameters:
+ *   wifi_auth - ESP Wi-Fi authenticate mode.
+ *
+ * Returned Value:
+ *   int - authenticate mode.
+ *
+ ****************************************************************************/
+
+static int esp_wifi_auth_trans(uint32_t wifi_auth)
+{
+  int auth_mode = IW_AUTH_WPA_VERSION_DISABLED;
+
+  switch (wifi_auth)
+    {
+      case WIFI_AUTH_OPEN:
+        auth_mode = IW_AUTH_WPA_VERSION_DISABLED;
+        break;
+
+      case WIFI_AUTH_WPA_PSK:
+        auth_mode = IW_AUTH_WPA_VERSION_WPA;
+        break;
+
+      case WIFI_AUTH_WPA2_PSK:
+      case WIFI_AUTH_WPA_WPA2_PSK:
+        auth_mode = IW_AUTH_WPA_VERSION_WPA2;
+        break;
+
+      case WIFI_AUTH_WPA3_PSK:
+      case WIFI_AUTH_WPA2_WPA3_PSK:
+        auth_mode = IW_AUTH_WPA_VERSION_WPA3;
+        break;
+
+      default:
+        wlerr("Failed to transfer wireless authmode: %" PRIu32, wifi_auth);
+        break;
+    }
+
+  return auth_mode;
+}
+
+/****************************************************************************
+ * Name: esp_wifi_cipher_trans
+ *
+ * Description:
+ *   Converts ESP Wi-Fi cipher type values to WEXT cipher type values.
+ *
+ * Input Parameters:
+ *   wifi_cipher - ESP Wi-Fi cipher type.
+ *
+ * Returned Value:
+ *   cipher type.
+ *
+ ****************************************************************************/
+
+static int esp_wifi_cipher_trans(uint32_t wifi_cipher)
+{
+  int cipher_mode = IW_AUTH_CIPHER_NONE;
+
+  switch (wifi_cipher)
+    {
+      case WIFI_CIPHER_TYPE_NONE:
+        cipher_mode = IW_AUTH_CIPHER_NONE;
+        break;
+
+      case WIFI_CIPHER_TYPE_WEP40:
+        cipher_mode = IW_AUTH_CIPHER_WEP40;
+        break;
+
+      case WIFI_CIPHER_TYPE_WEP104:
+        cipher_mode = IW_AUTH_CIPHER_WEP104;
+        break;
+
+      case WIFI_CIPHER_TYPE_TKIP:
+        cipher_mode = IW_AUTH_CIPHER_TKIP;
+        break;
+
+      case WIFI_CIPHER_TYPE_CCMP:
+      case WIFI_CIPHER_TYPE_TKIP_CCMP:
+        cipher_mode = IW_AUTH_CIPHER_CCMP;
+        break;
+
+      case WIFI_CIPHER_TYPE_AES_CMAC128:
+        cipher_mode = IW_AUTH_CIPHER_AES_CMAC;
+        break;
+
+      default:
+        wlerr("Failed to transfer wireless cipher: %" PRIu32, wifi_cipher);
+        break;
+    }
+
+  return cipher_mode;
+}
 
 /****************************************************************************
  * Public Functions
@@ -355,7 +474,18 @@ int esp_wifi_api_start(uint32_t start_mode)
 {
   int ret;
   wifi_mode_t mode;
+  wifi_mode_t target_mode;
   wifi_mode_t current_mode;
+  bool mode_changed = false;
+
+  mode = esp_wifi_mode_translate(start_mode);
+  if ((int)mode == -EINVAL)
+    {
+      wlerr("Invalid mode=%" PRIu32 "\n", start_mode);
+      return -EINVAL;
+    }
+
+  esp_wifi_lock(true);
 
   ret = esp_wifi_get_mode(&current_mode);
   if (ret)
@@ -366,69 +496,94 @@ int esp_wifi_api_start(uint32_t start_mode)
       goto errout;
     }
 
-  mode = esp_wifi_mode_translate(start_mode);
-  if (mode == -EINVAL)
-    {
-      wlerr("Invalid mode=%ld\n", start_mode);
-      return -EINVAL;
-    }
-
-  wlinfo("current_mode=%d, mode=%d\n", current_mode, mode);
+  target_mode = mode;
 
 #ifdef ESP_WLAN_HAS_APSTA
-  if ((mode == WIFI_MODE_STA && current_mode == WIFI_MODE_AP) ||
+  if (current_mode == WIFI_MODE_APSTA ||
+      (mode == WIFI_MODE_STA && current_mode == WIFI_MODE_AP) ||
       (mode == WIFI_MODE_AP && current_mode == WIFI_MODE_STA))
     {
       wlinfo("Wi-Fi mode set to APSTA\n");
-      mode = WIFI_MODE_APSTA;
+      target_mode = WIFI_MODE_APSTA;
     }
 #endif
 
-  esp_wifi_lock(true);
+  wlinfo("current_mode=%d, mode=%d, target_mode=%d\n",
+         current_mode, mode, target_mode);
 
-  ret = esp_wifi_set_mode(mode);
-  if (ret)
+  if (target_mode != current_mode)
     {
-      wlerr("Failed to set Wi-Fi mode=%d ret=%d\n", mode, ret);
-      ret = esp_wifi_to_errno(ret);
-      goto errout;
-    }
-
-  /* Use a default AP config for startup */
-
-#ifdef ESP_WLAN_HAS_SOFTAP
-  if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA)
-    {
-      wlinfo("Setting default AP config SSID=%s\n",
-             CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_SSID);
-      wifi_config_t wifi_config =
-        {
-          .ap =
-            {
-              .ssid = CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_SSID,
-              .ssid_len = strlen(CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_SSID),
-              .channel = CONFIG_ESPRESSIF_WIFI_SOFTAP_CHANNEL,
-              .password = CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_PASSWORD,
-              .max_connection = CONFIG_ESPRESSIF_WIFI_SOFTAP_MAX_CONNECTIONS,
-#ifdef CONFIG_ESPRESSIF_WIFI_SOFTAP_SAE_SUPPORT
-              .authmode = WIFI_AUTH_WPA3_PSK,
-              .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-#else /* CONFIG_ESPRESSIF_WIFI_SOFTAP_SAE_SUPPORT */
-              .authmode = WIFI_AUTH_WPA2_PSK,
-#endif
-              .pmf_cfg =
-                {
-                  .required = true,
-                },
-            },
-        };
-
-      ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+      ret = esp_wifi_set_mode(target_mode);
       if (ret)
         {
-          wlerr("Failed to set Wi-Fi config data ret=%d\n", ret);
+          wlerr("Failed to set Wi-Fi mode=%d ret=%d\n", target_mode, ret);
           ret = esp_wifi_to_errno(ret);
           goto errout;
+        }
+
+      mode_changed = true;
+    }
+
+  /* Populate the default SoftAP configuration only on the first SoftAP
+   * bring-up (before any runtime WAPI customization), so starting STA on
+   * top of an active SoftAP or bouncing SoftAP never clobbers user settings.
+   */
+
+#ifdef ESP_WLAN_HAS_SOFTAP
+  if (mode == WIFI_MODE_AP)
+    {
+      g_softap_pending_auth = false;
+      if (!g_softap_configured)
+        {
+          wifi_config_t wifi_config =
+            {
+              .ap =
+                {
+                  .ssid = CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_SSID,
+                  .ssid_len =
+                    strlen(CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_SSID),
+                  .channel = CONFIG_ESPRESSIF_WIFI_SOFTAP_CHANNEL,
+                  .password = CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_PASSWORD,
+                  .max_connection =
+                    CONFIG_ESPRESSIF_WIFI_SOFTAP_MAX_CONNECTIONS,
+#ifdef CONFIG_ESPRESSIF_WIFI_SOFTAP_SAE_SUPPORT
+                  .authmode = WIFI_AUTH_WPA3_PSK,
+                  .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+                  .pmf_cfg =
+                    {
+                      .capable = true,
+                      .required = true,
+                    },
+#else /* CONFIG_ESPRESSIF_WIFI_SOFTAP_SAE_SUPPORT */
+                  .authmode = WIFI_AUTH_WPA2_PSK,
+                  .pmf_cfg =
+                    {
+                      .capable = true,
+                      .required = false,
+                    },
+#endif
+                },
+            };
+
+          if (strlen(CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_PASSWORD) == 0)
+            {
+              wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+              wifi_config.ap.pmf_cfg.capable = false;
+              wifi_config.ap.pmf_cfg.required = false;
+            }
+
+          wlinfo("Setting default AP config SSID=%s\n",
+                 CONFIG_ESPRESSIF_WIFI_SOFTAP_DEFAULT_SSID);
+
+          ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+          if (ret)
+            {
+              wlerr("Failed to set Wi-Fi config data ret=%d\n", ret);
+              ret = esp_wifi_to_errno(ret);
+              goto errout_restore_mode;
+            }
+
+          g_softap_configured = true;
         }
     }
 #endif  /* ESP_WLAN_HAS_SOFTAP */
@@ -436,9 +591,9 @@ int esp_wifi_api_start(uint32_t start_mode)
   ret = esp_wifi_start();
   if (ret)
     {
-      wlerr("Failed to start Wi-Fi with mode=%d ret=%d\n", mode, ret);
+      wlerr("Failed to start Wi-Fi with mode=%d ret=%d\n", target_mode, ret);
       ret = esp_wifi_to_errno(ret);
-      goto errout;
+      goto errout_restore_mode;
     }
 
   ret = esp_wifi_get_mode(&current_mode);
@@ -455,6 +610,14 @@ int esp_wifi_api_start(uint32_t start_mode)
 errout:
   esp_wifi_lock(false);
   return ret;
+
+errout_restore_mode:
+  if (mode_changed)
+    {
+      esp_wifi_set_mode(current_mode);
+    }
+
+  goto errout;
 }
 
 /****************************************************************************
@@ -464,7 +627,8 @@ errout:
  *   Stops Wi-Fi AP, Station or both. Can be later resumed by
  *   esp_wifi_restore, but must be reconfigured.
  *
- *   If AP + SoftAP are running, be aware that both will be stopped.
+ *   In AP + STA mode, stopping one interface transitions to the remaining
+ *   active mode without disturbing it when supported by the Wi-Fi driver.
  *
  * Input Parameters:
  *   stop_mode - The Wi-Fi mode to stop (from wireless.h).
@@ -476,11 +640,32 @@ errout:
 
 int esp_wifi_api_stop(uint32_t stop_mode)
 {
-  int ret;
+  int ret = OK;
   wifi_mode_t mode;
   wifi_mode_t current_mode;
 
+  mode = esp_wifi_mode_translate(stop_mode);
+  if ((int)mode == -EINVAL)
+    {
+      wlerr("Invalid mode=%" PRIu32 "\n", stop_mode);
+      return -EINVAL;
+    }
+
   esp_wifi_lock(true);
+
+#ifdef ESP_WLAN_HAS_STA
+  if (mode == WIFI_MODE_STA)
+    {
+      g_sta_reconnect = false;
+    }
+#endif
+
+#ifdef ESP_WLAN_HAS_SOFTAP
+  if (mode == WIFI_MODE_AP)
+    {
+      g_softap_pending_auth = false;
+    }
+#endif
 
   ret = esp_wifi_get_mode(&current_mode);
   if (ret)
@@ -491,58 +676,92 @@ int esp_wifi_api_stop(uint32_t stop_mode)
       goto errout;
     }
 
-  mode = esp_wifi_mode_translate(stop_mode);
-  if (mode == -EINVAL)
-    {
-      wlerr("Invalid mode=%ld\n", stop_mode);
-      return -EINVAL;
-    }
-
   wlinfo("current_mode=%d, mode=%d\n", current_mode, mode);
 
-  ret = esp_wifi_stop();
-  if (ret)
+  if (current_mode == WIFI_MODE_NULL)
     {
-      wlerr("Failed to stop Wi-Fi ret=%d\n", ret);
-      ret = esp_wifi_to_errno(ret);
+      ret = OK;
       goto errout;
     }
 
-  wlinfo("Stopped Wi-Fi\n");
-
   if (current_mode == WIFI_MODE_APSTA)
     {
+      wifi_mode_t next_mode;
+
       if (mode == WIFI_MODE_STA)
         {
-          wlinfo("Restarting Wi-Fi in AP mode\n");
-          ret = esp_wifi_set_mode(WIFI_MODE_AP);
+          next_mode = WIFI_MODE_AP;
+          esp_wifi_disconnect();
         }
       else if (mode == WIFI_MODE_AP)
         {
-          wlinfo("Restarting Wi-Fi in STA mode\n");
-          ret = esp_wifi_set_mode(WIFI_MODE_STA);
+          next_mode = WIFI_MODE_STA;
         }
       else
         {
           wlerr("Invalid mode=%d\n", mode);
+          ret = -EINVAL;
           goto errout;
         }
 
+      /* Try dynamic downgrade first so the remaining interface stays up. */
+
+      ret = esp_wifi_set_mode(next_mode);
+      if (ret != ESP_OK)
+        {
+          wlwarn("Dynamic mode downgrade to %d failed (%d); restarting\n",
+                 next_mode, ret);
+          ret = esp_wifi_stop();
+          if (ret)
+            {
+              wlerr("Failed to stop Wi-Fi ret=%d\n", ret);
+              ret = esp_wifi_to_errno(ret);
+              goto errout;
+            }
+
+          ret = esp_wifi_set_mode(next_mode);
+          if (ret)
+            {
+              wlerr("Failed to reset Wi-Fi mode=%d ret=%d\n",
+                    next_mode, ret);
+              ret = esp_wifi_to_errno(ret);
+              goto errout;
+            }
+
+          ret = esp_wifi_start();
+          if (ret)
+            {
+              wlerr("Failed to restart Wi-Fi ret=%d\n", ret);
+              ret = esp_wifi_to_errno(ret);
+              goto errout;
+            }
+        }
+    }
+  else if (current_mode == mode)
+    {
+      ret = esp_wifi_stop();
       if (ret)
         {
-          wlerr("Failed to reset Wi-Fi mode=%d ret=%d\n",
-                WIFI_MODE_AP, ret);
+          wlerr("Failed to stop Wi-Fi ret=%d\n", ret);
           ret = esp_wifi_to_errno(ret);
           goto errout;
         }
 
-      ret = esp_wifi_start();
+      ret = esp_wifi_set_mode(WIFI_MODE_NULL);
       if (ret)
         {
-          wlerr("Failed to restart Wi-Fi ret=%d\n", ret);
+          wlerr("Failed to reset Wi-Fi mode to NULL ret=%d\n", ret);
           ret = esp_wifi_to_errno(ret);
           goto errout;
         }
+
+      wlinfo("Stopped Wi-Fi\n");
+    }
+  else
+    {
+      wlinfo("Wi-Fi mode=%d already inactive (current_mode=%d)\n",
+             mode, current_mode);
+      ret = OK;
     }
 
 errout:
@@ -568,6 +787,11 @@ errout:
 int esp_wifi_api_restore(void)
 {
   int ret;
+
+#ifdef ESP_WLAN_HAS_SOFTAP
+  g_softap_configured = false;
+  g_softap_pending_auth = false;
+#endif
 
   ret = esp_wifi_restore();
   if (ret)
@@ -1133,106 +1357,6 @@ int esp_wifi_sta_mode(struct iwreq *iwr, bool set)
 }
 
 /****************************************************************************
- * Name: esp_wifi_auth_trans
- *
- * Description:
- *   Converts authenticate mode values to WEXT authenticate mode.
- *
- * Input Parameters:
- *   wifi_auth - ESP Wi-Fi authenticate mode.
- *
- * Returned Value:
- *   int - authenticate mode.
- *
- ****************************************************************************/
-
-static int esp_wifi_auth_trans(uint32_t wifi_auth)
-{
-  int auth_mode = IW_AUTH_WPA_VERSION_DISABLED;
-
-  switch (wifi_auth)
-    {
-      case WIFI_AUTH_OPEN:
-        auth_mode = IW_AUTH_WPA_VERSION_DISABLED;
-        break;
-
-      case WIFI_AUTH_WPA_PSK:
-        auth_mode = IW_AUTH_WPA_VERSION_WPA;
-        break;
-
-      case WIFI_AUTH_WPA2_PSK:
-      case WIFI_AUTH_WPA_WPA2_PSK:
-        auth_mode = IW_AUTH_WPA_VERSION_WPA2;
-        break;
-
-      case WIFI_AUTH_WPA3_PSK:
-      case WIFI_AUTH_WPA2_WPA3_PSK:
-        auth_mode = IW_AUTH_WPA_VERSION_WPA3;
-        break;
-
-      default:
-        wlerr("Failed to transfer wireless authmode: %ld", wifi_auth);
-        break;
-    }
-
-  return auth_mode;
-}
-
-/****************************************************************************
- * Name: esp_wifi_cipher_trans
- *
- * Description:
- *   Converts a ESP32-C6 cipher type values to WEXT cipher type values.
- *
- * Input Parameters:
- *   wifi_cipher - ESP Wi-Fi cipher type.
- *
- * Returned Value:
- *   cipher type.
- *
- ****************************************************************************/
-
-static int esp_wifi_cipher_trans(uint32_t wifi_cipher)
-{
-  int cipher_mode = IW_AUTH_CIPHER_NONE;
-
-  switch (wifi_cipher)
-    {
-      case WIFI_CIPHER_TYPE_NONE:
-        cipher_mode = IW_AUTH_CIPHER_NONE;
-        break;
-
-      case WIFI_CIPHER_TYPE_WEP40:
-        cipher_mode = IW_AUTH_CIPHER_WEP40;
-        break;
-
-      case WIFI_CIPHER_TYPE_WEP104:
-        cipher_mode = IW_AUTH_CIPHER_WEP104;
-        break;
-
-      case WIFI_CIPHER_TYPE_TKIP:
-        cipher_mode = IW_AUTH_CIPHER_TKIP;
-        break;
-
-      case WIFI_CIPHER_TYPE_CCMP:
-      case WIFI_CIPHER_TYPE_TKIP_CCMP:
-        cipher_mode = IW_AUTH_CIPHER_CCMP;
-        break;
-
-      case WIFI_CIPHER_TYPE_AES_CMAC128:
-        cipher_mode = IW_AUTH_CIPHER_AES_CMAC;
-        break;
-
-      default:
-        wlerr("Failed to transfer wireless authmode: %ld",
-              wifi_cipher);
-        break;
-    }
-
-  return cipher_mode;
-}
-
-/****************************************************************************
  * Name: esp_wifi_sta_auth
  *
  * Description:
@@ -1655,6 +1779,12 @@ int esp_wifi_sta_channel(struct iwreq *iwr, bool set)
     }
   else
     {
+      if (iwr->u.data.pointer == NULL ||
+          iwr->u.data.length < sizeof(struct iw_range))
+        {
+          return -EINVAL;
+        }
+
       ret = esp_wifi_get_country(&country);
       if (ret)
         {
@@ -1663,12 +1793,12 @@ int esp_wifi_sta_channel(struct iwreq *iwr, bool set)
         }
 
       range = (struct iw_range *)iwr->u.data.pointer;
-      range->num_frequency = country.nchan;
+      range->num_frequency = MIN(country.nchan, IW_MAX_FREQUENCIES);
       for (k = 1; k <= range->num_frequency; k++)
         {
           range->freq[k - 1].i = k;
           range->freq[k - 1].e = 0;
-          range->freq[k - 1].m = 2407 + 5 * k;
+          range->freq[k - 1].m = (k == 14) ? 2484 : (2407 + 5 * k);
         }
     }
 
@@ -1825,27 +1955,53 @@ int esp_wifi_softap_password(struct iwreq *iwr, bool set)
   DEBUGASSERT(ext != NULL);
 
   pdata = ext->key;
-  len = ext->key_len;
 
-  if (set && len > PWD_MAX_LEN)
+  ret = esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
+  if (ret)
     {
-      return -EINVAL;
+      wlerr("Failed to get SoftAP config data ret=%d\n", ret);
+      return esp_wifi_to_errno(ret);
     }
-
-  pdata = ext->key;
-  len   = ext->key_len;
-
-  esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
 
   if (set)
     {
+      len = ext->key_len;
+      if (len > PWD_MAX_LEN)
+        {
+          return -EINVAL;
+        }
+
       /* Clear the password field and copy the user password to it */
 
       memset(wifi_cfg.ap.password, 0x0, PWD_MAX_LEN);
 
-      if (ext->alg != IW_ENCODE_ALG_NONE)
+      if (ext->alg == IW_ENCODE_ALG_NONE || len == 0)
+        {
+          wifi_cfg.ap.authmode = WIFI_AUTH_OPEN;
+          wifi_cfg.ap.pmf_cfg.capable = false;
+          wifi_cfg.ap.pmf_cfg.required = false;
+          g_softap_pending_auth = false;
+        }
+      else
         {
           memcpy(wifi_cfg.ap.password, pdata, len);
+          if (g_softap_pending_auth)
+            {
+              wifi_cfg.ap.authmode = g_softap_pending_authmode;
+              wifi_cfg.ap.pmf_cfg = g_softap_pending_pmf;
+              if (wifi_cfg.ap.authmode == WIFI_AUTH_WPA3_PSK)
+                {
+                  wifi_cfg.ap.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+                }
+
+              g_softap_pending_auth = false;
+            }
+          else if (wifi_cfg.ap.authmode == WIFI_AUTH_OPEN)
+            {
+              wifi_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+              wifi_cfg.ap.pmf_cfg.capable = true;
+              wifi_cfg.ap.pmf_cfg.required = false;
+            }
         }
 
       ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg);
@@ -1857,15 +2013,56 @@ int esp_wifi_softap_password(struct iwreq *iwr, bool set)
     }
   else
     {
+      if (iwr->u.encoding.length < sizeof(*ext))
+        {
+          return -EINVAL;
+        }
+
+      len = iwr->u.encoding.length - sizeof(*ext);
       size = strnlen((char *)wifi_cfg.ap.password, PWD_MAX_LEN);
       if (len < size)
         {
           return -EINVAL;
         }
+
+      ext->key_len = size;
+      memcpy(pdata, wifi_cfg.ap.password, ext->key_len);
+      len = size;
+
+      if (wifi_cfg.ap.authmode == WIFI_AUTH_OPEN)
+        {
+          ext->alg = IW_ENCODE_ALG_NONE;
+        }
       else
         {
-          len = size;
-          memcpy(pdata, wifi_cfg.ap.password, len);
+          switch (wifi_cfg.ap.pairwise_cipher)
+            {
+              case WIFI_CIPHER_TYPE_NONE:
+                ext->alg = IW_ENCODE_ALG_CCMP;
+                break;
+
+              case WIFI_CIPHER_TYPE_WEP40:
+              case WIFI_CIPHER_TYPE_WEP104:
+                ext->alg = IW_ENCODE_ALG_WEP;
+                break;
+
+              case WIFI_CIPHER_TYPE_TKIP:
+                ext->alg = IW_ENCODE_ALG_TKIP;
+                break;
+
+              case WIFI_CIPHER_TYPE_CCMP:
+              case WIFI_CIPHER_TYPE_TKIP_CCMP:
+                ext->alg = IW_ENCODE_ALG_CCMP;
+                break;
+
+              case WIFI_CIPHER_TYPE_AES_CMAC128:
+                ext->alg = IW_ENCODE_ALG_AES_CMAC;
+                break;
+
+              default:
+                ext->alg = IW_ENCODE_ALG_CCMP;
+                break;
+            }
         }
     }
 
@@ -1915,7 +2112,12 @@ int esp_wifi_softap_essid(struct iwreq *iwr, bool set)
       return -EINVAL;
     }
 
-  esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
+  ret = esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
+  if (ret)
+    {
+      wlerr("Failed to get SoftAP config data ret=%d\n", ret);
+      return esp_wifi_to_errno(ret);
+    }
 
   if (set)
     {
@@ -1931,7 +2133,9 @@ int esp_wifi_softap_essid(struct iwreq *iwr, bool set)
     }
   else
     {
-      size = strnlen((char *)wifi_cfg.ap.ssid, IW_ESSID_MAX_SIZE);
+      size = wifi_cfg.ap.ssid_len ?
+             MIN(wifi_cfg.ap.ssid_len, IW_ESSID_MAX_SIZE) :
+             strnlen((char *)wifi_cfg.ap.ssid, IW_ESSID_MAX_SIZE);
       if (len < size)
         {
           return -EINVAL;
@@ -1940,6 +2144,8 @@ int esp_wifi_softap_essid(struct iwreq *iwr, bool set)
         {
           len = size;
           memcpy(pdata, wifi_cfg.ap.ssid, len);
+          essid->length = len;
+          essid->flags = (len > 0) ? IW_ESSID_ON : IW_ESSID_OFF;
         }
     }
 
@@ -1970,7 +2176,13 @@ int esp_wifi_softap_essid(struct iwreq *iwr, bool set)
 
 int esp_wifi_softap_bssid(struct iwreq *iwr, bool set)
 {
-  return -ENOSYS;
+  if (set)
+    {
+      return -ENOSYS;
+    }
+
+  iwr->u.ap_addr.sa_family = ARPHRD_ETHER;
+  return esp_wifi_softap_read_mac((uint8_t *)iwr->u.ap_addr.sa_data);
 }
 
 /****************************************************************************
@@ -2062,15 +2274,23 @@ int esp_wifi_softap_mode(struct iwreq *iwr, bool set)
 
 int esp_wifi_softap_auth(struct iwreq *iwr, bool set)
 {
-  int ret;
+  int ret = OK;
   int cmd;
   wifi_config_t wifi_cfg;
 
-  esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
+  ret = esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
+  if (ret)
+    {
+      wlerr("Failed to get SoftAP config data ret=%d\n", ret);
+      return esp_wifi_to_errno(ret);
+    }
+
+  cmd = iwr->u.param.flags & IW_AUTH_INDEX;
 
   if (set)
     {
-      cmd = iwr->u.param.flags & IW_AUTH_INDEX;
+      bool defer_commit = false;
+
       switch (cmd)
         {
           case IW_AUTH_WPA_VERSION:
@@ -2079,22 +2299,29 @@ int esp_wifi_softap_auth(struct iwreq *iwr, bool set)
                 {
                   case IW_AUTH_WPA_VERSION_DISABLED:
                       wifi_cfg.ap.authmode = WIFI_AUTH_OPEN;
+                      wifi_cfg.ap.pmf_cfg.capable = false;
+                      wifi_cfg.ap.pmf_cfg.required = false;
+                      g_softap_pending_auth = false;
                       wlinfo("set authmode to WIFI_AUTH_OPEN\n");
                       break;
 
                   case IW_AUTH_WPA_VERSION_WPA:
                       wifi_cfg.ap.authmode = WIFI_AUTH_WPA_PSK;
+                      wifi_cfg.ap.pmf_cfg.capable = false;
+                      wifi_cfg.ap.pmf_cfg.required = false;
                       wlinfo("set authmode to WIFI_AUTH_WPA_PSK\n");
                       break;
 
                   case IW_AUTH_WPA_VERSION_WPA2:
                       wifi_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+                      wifi_cfg.ap.pmf_cfg.capable = true;
+                      wifi_cfg.ap.pmf_cfg.required = false;
                       wlinfo("set authmode to WIFI_AUTH_WPA2_PSK\n");
                       break;
 
                   case IW_AUTH_WPA_VERSION_WPA3:
+                      wifi_cfg.ap.pmf_cfg.capable = true;
                       wifi_cfg.ap.pmf_cfg.required = true;
-                      wifi_cfg.ap.pmf_cfg.capable = false;
                       wifi_cfg.ap.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
                       wifi_cfg.ap.authmode = WIFI_AUTH_WPA3_PSK;
                       wlinfo("set authmode to WIFI_AUTH_WPA3_PSK\n");
@@ -2104,6 +2331,19 @@ int esp_wifi_softap_auth(struct iwreq *iwr, bool set)
                       wlerr("Invalid wpa version %" PRId32 "\n",
                             iwr->u.param.value);
                       return -EINVAL;
+                }
+
+              if (wifi_cfg.ap.authmode != WIFI_AUTH_OPEN &&
+                  wifi_cfg.ap.password[0] == '\0')
+                {
+                  g_softap_pending_auth = true;
+                  g_softap_pending_authmode = wifi_cfg.ap.authmode;
+                  g_softap_pending_pmf = wifi_cfg.ap.pmf_cfg;
+                  defer_commit = true;
+                }
+              else
+                {
+                  g_softap_pending_auth = false;
                 }
             }
               break;
@@ -2171,16 +2411,35 @@ int esp_wifi_softap_auth(struct iwreq *iwr, bool set)
               return -EINVAL;
         }
 
-      ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg);
-      if (ret)
+      if (!defer_commit)
         {
-          wlerr("Failed to set Wi-Fi config data ret=%d\n", ret);
-          return esp_wifi_to_errno(ret);
+          ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg);
+          if (ret)
+            {
+              wlerr("Failed to set Wi-Fi config data ret=%d\n", ret);
+              return esp_wifi_to_errno(ret);
+            }
         }
     }
   else
     {
-      return -ENOSYS;
+      switch (cmd)
+        {
+          case IW_AUTH_WPA_VERSION:
+              iwr->u.param.value =
+                esp_wifi_auth_trans(wifi_cfg.ap.authmode);
+              break;
+
+          case IW_AUTH_CIPHER_PAIRWISE:
+          case IW_AUTH_CIPHER_GROUP:
+              iwr->u.param.value =
+                esp_wifi_cipher_trans(wifi_cfg.ap.pairwise_cipher);
+              break;
+
+          default:
+              wlerr("Unknown cmd %d\n", cmd);
+              return -ENOSYS;
+        }
     }
 
   return ret;
@@ -2207,11 +2466,34 @@ int esp_wifi_softap_freq(struct iwreq *iwr, bool set)
   int ret;
   wifi_config_t wifi_cfg;
 
-  esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
+  ret = esp_wifi_get_config(WIFI_IF_AP, &wifi_cfg);
+  if (ret)
+    {
+      wlerr("Failed to get SoftAP config data ret=%d\n", ret);
+      return esp_wifi_to_errno(ret);
+    }
 
   if (set)
     {
-      int channel = esp_freq_to_channel(iwr->u.freq.m);
+      int channel;
+
+      if (iwr->u.freq.e == 0 &&
+          iwr->u.freq.m >= 1 && iwr->u.freq.m <= 14)
+        {
+          channel = iwr->u.freq.m;
+        }
+      else
+        {
+          channel = esp_freq_to_channel(iwr->u.freq.m);
+        }
+
+      if (channel <= 0)
+        {
+          wlerr("Invalid SoftAP frequency/channel: m=%" PRId32 " e=%d\n",
+                iwr->u.freq.m, iwr->u.freq.e);
+          return -EINVAL;
+        }
+
       wifi_cfg.ap.channel = channel;
 
       ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg);
@@ -2223,9 +2505,22 @@ int esp_wifi_softap_freq(struct iwreq *iwr, bool set)
     }
   else
     {
+      uint8_t primary = 0;
+      wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+      uint8_t channel;
+
+      if (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary > 0)
+        {
+          channel = primary;
+        }
+      else
+        {
+          channel = wifi_cfg.ap.channel ? wifi_cfg.ap.channel : 1;
+        }
+
       iwr->u.freq.flags = IW_FREQ_FIXED;
       iwr->u.freq.e     = 0;
-      iwr->u.freq.m     = 2407 + 5 * wifi_cfg.ap.channel;
+      iwr->u.freq.m     = (channel == 14) ? 2484 : (2407 + 5 * channel);
     }
 
   return OK;
